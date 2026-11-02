@@ -129,7 +129,11 @@ static void test_gate_stub(void) {
 }
 
 static WORD fake_pad_buttons;
+static DWORD fake_pad_result;
+static volatile LONG fake_pad_reads;
 static DWORD WINAPI fake_xinput(DWORD user, sc6_xinput_state *st) {
+  InterlockedIncrement(&fake_pad_reads);
+  if (fake_pad_result) return fake_pad_result;
   memset(st, 0, sizeof(*st));
   st->buttons = user == 0 ? fake_pad_buttons : 0;
   return ERROR_SUCCESS;
@@ -143,7 +147,6 @@ static void test_input_hook(void) {
   orig_xinput_get_state = fake_xinput;
   input_engine_thread = GetCurrentThreadId();
   cfg_early_step = early_step_available = input_in_battle = 1;
-  input_online = 0;
   input_phase = 1;
   g_skip_battle = 1;
   gate_last_dt = 1.0 / 120.0;
@@ -174,6 +177,77 @@ static void test_input_hook(void) {
   memset(xi_sticky, 0, sizeof(xi_sticky));
   hook_xinput_get_state(0, &st);
   assert(st.buttons == 0);
+  /* Capture a tap entirely between engine reads. */
+  sc6_xinput_state raw = {0};
+  raw.buttons = 0x1000;
+  input_observe(0, ERROR_SUCCESS, &raw);
+  raw.buttons = 0;
+  input_observe(0, ERROR_SUCCESS, &raw);
+  hook_xinput_get_state(0, &st);
+  assert(st.buttons == 0x1000);
+  memset(xi_sticky, 0, sizeof(xi_sticky));
+  hook_xinput_get_state(0, &st);
+  assert(st.buttons == 0); /* The retained tap is consumed once. */
+
+  /* Disconnect and reconnect before the next engine read. */
+  raw.buttons = 0x2000;
+  input_observe(0, ERROR_SUCCESS, &raw);
+  input_observe(0, ERROR_DEVICE_NOT_CONNECTED, NULL);
+  raw.buttons = 0;
+  input_observe(0, ERROR_SUCCESS, &raw);
+  hook_xinput_get_state(0, &st);
+  assert(st.buttons == 0 && xi_sticky[0] == 0 && xi_last[0] == 0);
+  /* A reconnect with the same held button is a new press. */
+  fake_pad_buttons = 0x2000;
+  hook_xinput_get_state(0, &st);
+  fake_pad_result = ERROR_DEVICE_NOT_CONNECTED;
+  assert(hook_xinput_get_state(0, &st) == ERROR_DEVICE_NOT_CONNECTED);
+  assert(xi_last[0] == 0 && xi_sticky[0] == 0);
+  fake_pad_result = ERROR_SUCCESS;
+  hook_xinput_get_state(0, &st);
+  assert(st.buttons == 0x2000 && xi_sticky[0] == 0x2000);
+  /* Other errors do not erase input. Slots remain independent. */
+  raw.buttons = 0x4000;
+  input_observe(1, ERROR_SUCCESS, &raw);
+  input_observe(1, ERROR_BAD_ARGUMENTS, NULL);
+  input_observe(4, ERROR_DEVICE_NOT_CONNECTED, NULL);
+  assert(poll_pending[1] == 0x4000);
+  assert(xi_sticky[0] == 0x2000);
+  input_observe(1, ERROR_DEVICE_NOT_CONNECTED, NULL);
+
+  /* The reader runs without engine frames and never changes the gate. */
+  fake_pad_buttons = 0;
+  cfg_input_poll_hz = 250;
+  fake_pad_reads = 0;
+  input_poll_stop = 0;
+  g_skip_battle = 1;
+  double debt = gate_acc;
+  HANDLE reader = CreateThread(NULL, 0, input_poll_main, NULL, 0, NULL);
+  assert(reader);
+  Sleep(100);
+  InterlockedExchange(&input_poll_stop, 1);
+  assert(WaitForSingleObject(reader, 2000) == WAIT_OBJECT_0);
+  CloseHandle(reader);
+  assert(fake_pad_reads >= 8);
+  assert(g_skip_battle == 1 && gate_acc == debt);
+  /* Empty slots retry slowly instead of enumerating devices every cycle. */
+  fake_pad_result = ERROR_DEVICE_NOT_CONNECTED;
+  fake_pad_reads = 0;
+  input_poll_stop = 0;
+  memset(poll_retry_at, 0, sizeof(poll_retry_at));
+  reader = CreateThread(NULL, 0, input_poll_main, NULL, 0, NULL);
+  assert(reader);
+  Sleep(100);
+  InterlockedExchange(&input_poll_stop, 1);
+  assert(WaitForSingleObject(reader, 2000) == WAIT_OBJECT_0);
+  CloseHandle(reader);
+  assert(fake_pad_reads == 4);
+  fake_pad_result = ERROR_SUCCESS;
+  raw.buttons = 0;
+  input_observe(0, ERROR_SUCCESS, &raw);
+  assert(poll_retry_at[0] == 0); /* An engine read re-enables this slot immediately. */
+  puts("Input taps, disconnects, reconnects, slot isolation, reader scheduling, and empty-slot backoff passed.");
+  cfg_input_poll_hz = 0;
   cfg_input_latch = 0;
   orig_xinput_get_state = NULL;
   input_engine_thread = 0;

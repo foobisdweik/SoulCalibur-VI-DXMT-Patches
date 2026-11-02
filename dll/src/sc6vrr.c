@@ -989,7 +989,9 @@ static int install_frame_timers(void) {
  * (FUN_1403fcd10), and "pressed" is (previous word ^ this word) & this word,
  * so it compares two step samples. UE4 reads the pad with XInputGetState once
  * per engine frame (120 times per second at 120 fps), but the battle only uses
- * the reads on frames that run a step. Two options use the other frames:
+ * the reads on frames that run a step. A background reader targets 250 Hz
+ * by default, independently of rendering, and retains observed presses.
+ * Two options use the reads between steps:
  *  - SC6VRR_INPUT_LATCH=1: a button that goes down is reported as held until
  *    a battle step has run. A tap that ends between two steps therefore still
  *    reaches the battle, as a press of one step.
@@ -1001,12 +1003,11 @@ static int install_frame_timers(void) {
  *    counts (parry windows, hitstun, move lengths) do not change. Only face
  *    buttons, shoulder buttons, triggers and stick clicks start an early step.
  *    Directions do not, so walking and motion inputs keep the regular rhythm.
- *    It is off in online matches and outside battles. F5 toggles it.
+ *    This mod is for offline play. It is off outside battles. F5 toggles it.
  * Both need SC6VRR_GATE=1. The early step works only if UE4 reads the pad on
  * the game thread after UpdateTimeAndHandleMaxTickRate and before UWorld::Tick
  * (where the battle runs). The DLL counts where each read happens and logs it
  * every second, and it starts no early step from a read anywhere else. */
-#define ADDR_ONLINE_CHECK 0x1403f2590ull /* ALuxBattleManager_CheckOnlineSessionActive, no arguments */
 static volatile LONG64 g_frames; /* engine frames, counted in the UpdateTime hooks */
 #define GATE_STEP (1.0 / 60.0)
 #define XI_LT 0x0400       /* two wButtons bits that XInput leaves unused: the DLL's trigger flags */
@@ -1025,9 +1026,91 @@ static xinput_get_state_fn orig_xinput_get_state;
 static int cfg_input_latch, cfg_early_step, early_step_available;
 static DWORD input_engine_thread; /* the thread that runs UpdateTime */
 static int input_phase;           /* 1 = after UpdateTime, 2 = inside UWorld::Tick, 0 = after it */
-static int input_in_battle, input_online;
+static int input_in_battle;
 static double gate_acc, gate_last_dt; /* step accumulator (seconds) and the last engine frame time */
 static WORD xi_last[4], xi_sticky[4]; /* per pad: buttons at the last read, and buttons latched down */
+/* The reader records edges. Only the game thread changes the battle gate.
+ * Hold this lock across each read so observations remain in read order. */
+static SRWLOCK input_lock = SRWLOCK_INIT;
+static WORD poll_last[4], poll_pending[4];
+static unsigned poll_generation[4], xi_generation[4];
+static ULONGLONG poll_retry_at[4];
+static int cfg_input_poll_hz;
+static volatile LONG input_poll_stop, input_poll_cycles;
+static int input_poll_started;
+
+static WORD input_buttons(const sc6_xinput_state *st) {
+  WORD b = st->buttons & ~(XI_LT | XI_RT);
+  if (st->left_trigger > XI_TRIGGER_DOWN) b |= XI_LT;
+  if (st->right_trigger > XI_TRIGGER_DOWN) b |= XI_RT;
+  return b;
+}
+
+/* Caller holds input_lock. A disconnect invalidates pending input even if
+ * a new controller reconnects before the game next reads this slot. */
+static void input_observe(DWORD user, DWORD result, const sc6_xinput_state *st) {
+  if (user >= 4) return;
+  if (result == ERROR_DEVICE_NOT_CONNECTED) {
+    poll_last[user] = poll_pending[user] = 0;
+    poll_generation[user]++;
+    poll_retry_at[user] = GetTickCount64() + 1000;
+  } else if (result == ERROR_SUCCESS && st) {
+    poll_retry_at[user] = 0;
+    WORD b = input_buttons(st);
+    poll_pending[user] |= b & ~poll_last[user];
+    poll_last[user] = b;
+  }
+}
+
+static DWORD WINAPI input_poll_main(LPVOID unused) {
+  (void)unused;
+  double period = 1.0 / cfg_input_poll_hz;
+  double next = qpc_seconds();
+  while (!InterlockedCompareExchange(&input_poll_stop, 0, 0)) {
+    for (DWORD user = 0; user < 4; user++) {
+      sc6_xinput_state state;
+      AcquireSRWLockExclusive(&input_lock);
+      /* Empty slots can trigger costly device enumeration in Wine.
+       * Engine reads can discover reconnects before this retry expires. */
+      if (GetTickCount64() >= poll_retry_at[user]) {
+        DWORD result = orig_xinput_get_state(user, &state);
+        input_observe(user, result, &state);
+      }
+      ReleaseSRWLockExclusive(&input_lock);
+    }
+    InterlockedIncrement(&input_poll_cycles);
+    next += period;
+    double now = qpc_seconds();
+    if (next < now) next = now + period; /* Do not burst after a stall. */
+    double remaining = next - now;
+    DWORD ms = (DWORD)(remaining * 1000.0);
+    Sleep(ms ? ms : 1);
+    /* Sleep can return early after rounding down to milliseconds. */
+    while (!InterlockedCompareExchange(&input_poll_stop, 0, 0) && qpc_seconds() < next)
+      Sleep(1);
+  }
+  return 0;
+}
+
+static void start_input_poll(void) {
+  if (input_poll_started || !cfg_input_poll_hz || !orig_xinput_get_state) return;
+  input_poll_started = 1;
+  /* Keep the module loaded while its process-lifetime reader runs. */
+  HMODULE pinned;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                         (LPCWSTR)(ULONG_PTR)input_poll_main, &pinned)) {
+    log_msg("input: cannot pin module; background polling off");
+    return;
+  }
+  HANDLE thread = CreateThread(NULL, 0, input_poll_main, NULL, 0, NULL);
+  if (thread) {
+    CloseHandle(thread);
+    log_msg("input: background polling target=%d Hz; offline play only", cfg_input_poll_hz);
+  } else {
+    log_msg("input: reader thread creation failed; using engine reads");
+  }
+}
+
 static struct {
   unsigned reads, before_world, in_world, after_world, other_thread, presses, latched, early, world_ticks, buttons, on_step, not_due;
 } input_stats;
@@ -1101,11 +1184,25 @@ static void install_input_trace(void) {
 
 /* Runs in place of the exe's import of XInputGetState (XINPUT1_3 ordinal 2). */
 static DWORD WINAPI hook_xinput_get_state(DWORD user, sc6_xinput_state *st) {
-  DWORD r = orig_xinput_get_state(user, st);
   if (GetCurrentThreadId() != input_engine_thread) {
     input_stats.other_thread++; /* left unchanged: the per-pad state belongs to the game thread */
-    return r;
+    return orig_xinput_get_state(user, st);
   }
+  AcquireSRWLockExclusive(&input_lock);
+  DWORD r = orig_xinput_get_state(user, st);
+  input_observe(user, r, st);
+  WORD pending = 0;
+  if (user < 4) {
+    if (xi_generation[user] != poll_generation[user]) {
+      xi_last[user] = xi_sticky[user] = 0;
+      xi_generation[user] = poll_generation[user];
+    }
+    if (r == ERROR_SUCCESS && st) {
+      pending = poll_pending[user];
+      poll_pending[user] = 0;
+    }
+  }
+  ReleaseSRWLockExclusive(&input_lock);
   int phase = input_phase;
   input_stats.reads++;
   if (phase == 1)
@@ -1116,15 +1213,11 @@ static DWORD WINAPI hook_xinput_get_state(DWORD user, sc6_xinput_state *st) {
     input_stats.after_world++;
   if (r != ERROR_SUCCESS || user >= 4 || !st)
     return r;
-  WORD b = st->buttons & ~(XI_LT | XI_RT);
-  if (st->left_trigger > XI_TRIGGER_DOWN)
-    b |= XI_LT;
-  if (st->right_trigger > XI_TRIGGER_DOWN)
-    b |= XI_RT;
-  WORD down = b & ~xi_last[user];
-  if (b != xi_last[user])
-    input_trace("trace X f=%lld step=%d pad=%lu buttons=%04x", (long long)g_frames, !g_skip_battle,
-                (unsigned long)user, b);
+  WORD b = input_buttons(st);
+  WORD down = (b & ~xi_last[user]) | pending;
+  if (b != xi_last[user] || pending)
+    input_trace("trace X f=%lld step=%d pad=%lu buttons=%04x pending=%04x", (long long)g_frames, !g_skip_battle,
+                (unsigned long)user, b, pending);
   xi_last[user] = b;
   if (down)
     input_stats.presses++;
@@ -1152,7 +1245,7 @@ static DWORD WINAPI hook_xinput_get_state(DWORD user, sc6_xinput_state *st) {
       input_stats.not_due++; /* the next step is more than one frame away */
   }
   if (cfg_early_step && early_step_available && (down & XI_EARLY_MASK) && phase == 1 && g_skip_battle &&
-      input_in_battle && !input_online && due) {
+      input_in_battle && due) {
     /* 0.5 ms of slack: at 120 fps the two sides are nearly equal, and
      * timer jitter would otherwise block about half of the early steps. */
     gate_acc -= GATE_STEP;
@@ -1168,6 +1261,7 @@ static void input_frame(void) {
   input_phase = 1;
   if (!orig_xinput_get_state)
     return;
+  start_input_poll();
   static int f5_was_down;
   int f5 = (GetAsyncKeyState(VK_F5) & 0x8000) != 0;
   if (f5 && !f5_was_down && early_step_available) {
@@ -1175,11 +1269,10 @@ static void input_frame(void) {
     log_msg("live: F5: SC6VRR_EARLY_STEP=%d", cfg_early_step);
   }
   f5_was_down = f5;
-  /* In a battle = the battle frame counter moved during the last 30 engine
-   * frames. The game calls the online check itself on every battle step, so
-   * the DLL calls it only then, and at most every 30 frames. */
+  /* A moving battle counter identifies a battle. This offline mod does
+   * not query online session status. */
   static uint32_t last_counter;
-  static LONG64 last_change, last_check;
+  static LONG64 last_change;
   static int primed;
   uint32_t c = *(volatile uint32_t *)ADDR(ADDR_BATTLE_COUNTER);
   if (!primed)
@@ -1188,13 +1281,6 @@ static void input_frame(void) {
     last_change = g_frames;
   last_counter = c;
   int in_battle = last_change && g_frames - last_change < 30;
-  if (in_battle && early_step_available && g_frames - last_check >= 30) {
-    last_check = g_frames;
-    int online = ((char (*)(void))ADDR(ADDR_ONLINE_CHECK))() != 0;
-    if (online != input_online)
-      log_msg("input: online session %s; early steps %s", online ? "active" : "ended", online ? "off" : "allowed");
-    input_online = online;
-  }
   if (in_battle != input_in_battle)
     log_msg("input: battle %s", in_battle ? "running" : "not running");
   input_in_battle = in_battle;
@@ -1328,11 +1414,12 @@ static void hook_update_time(void *self) {
   if (now - window_start >= 1.0) {
     if (orig_xinput_get_state) {
       log_msg("frames=%u steps=%u (%u early) (%.6f s); pad reads=%u (after UpdateTime %u, in world tick %u, "
-              "after world tick %u, other threads %u) world_ticks=%u presses=%u (buttons %u: %u on step frames, %u with no step due) latched_reads=%u battle=%d online=%d "
-              "early_step=%d",
+              "after world tick %u, other threads %u) world_ticks=%u presses=%u (buttons %u: %u on step frames, %u with no step due) latched_reads=%u battle=%d "
+              "early_step=%d poll_cycles=%ld",
               frames, steps + input_stats.early, input_stats.early, now - window_start, input_stats.reads,
               input_stats.before_world, input_stats.in_world, input_stats.after_world, input_stats.other_thread, input_stats.world_ticks,
-              input_stats.presses, input_stats.buttons, input_stats.on_step, input_stats.not_due, input_stats.latched, input_in_battle, input_online, cfg_early_step);
+              input_stats.presses, input_stats.buttons, input_stats.on_step, input_stats.not_due, input_stats.latched, input_in_battle, cfg_early_step,
+              InterlockedExchange(&input_poll_cycles, 0));
       memset(&input_stats, 0, sizeof(input_stats));
       if (cfg_input_trace && input_in_battle) {
         static uint64_t last_passes[GATE_COUNT_MAX];
@@ -4227,12 +4314,12 @@ static void install_input(int world_hooked) {
     return;
   }
   orig_xinput_get_state = (xinput_get_state_fn)previous;
-  early_step_available = world_hooked && bytes_match(ADDR(ADDR_ONLINE_CHECK), "4057" "4883ec30" "488d4c2420e8");
+  early_step_available = world_hooked;
   if (!early_step_available)
     cfg_early_step = 0;
   log_msg("input: XInputGetState hooked; latch=%d early_step=%d (%s)", cfg_input_latch, cfg_early_step,
           early_step_available ? "F5 toggles it"
-                               : "unavailable: no UWorld::Tick hook or online check mismatch");
+                               : "unavailable: no UWorld::Tick hook");
 }
 
 /* SC6VRR_FAST_CRT: x86 versions of the next most-called imports (counts
@@ -4970,6 +5057,9 @@ static void setup(void) {
   cfg_input_latch = env_int("SC6VRR_INPUT_LATCH", 1);
   cfg_early_step = env_int("SC6VRR_EARLY_STEP", 1);
   cfg_input_trace = env_int("SC6VRR_INPUT_TRACE", 0);
+  cfg_input_poll_hz = env_int("SC6VRR_INPUT_POLL_HZ", 250);
+  if (cfg_input_poll_hz < 0) cfg_input_poll_hz = 0;
+  if (cfg_input_poll_hz > 1000) cfg_input_poll_hz = 1000;
   if ((cfg_input_latch || cfg_early_step) && !cfg_gate) {
     log_msg("input: SC6VRR_INPUT_LATCH and SC6VRR_EARLY_STEP need SC6VRR_GATE=1; both off");
     cfg_input_latch = cfg_early_step = 0;
@@ -5130,6 +5220,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
      * patching code here cannot race with game threads. */
     setup();
   } else if (reason == DLL_PROCESS_DETACH) {
+    InterlockedExchange(&input_poll_stop, 1);
     sample_stop = 1; /* the sampler writes its last file when it sees this */
     ufunc_watch_stop = 1;
     if (thread_name_observer) {
