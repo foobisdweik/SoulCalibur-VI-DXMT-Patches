@@ -256,10 +256,91 @@ static void test_input_hook(void) {
   memset(&input_stats, 0, sizeof(input_stats));
 }
 
+/* Commands apply through the same named events as the external client. */
+static void test_input_control(void) {
+  cfg_input_poll_hz = 125;
+  cfg_input_latch = cfg_early_step = 1;
+  input_control_frame(100, 10.0);
+  assert(input_control && input_control_request && input_control_done);
+  assert(input_control->version == SC6_INPUT_CONTROL_VERSION);
+  HANDLE client = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, "missing-test-mapping");
+  assert(!client);
+  char name[128];
+  sc6_input_object_name(name, sizeof(name), GetCurrentProcessId(), "map");
+  client = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, name);
+  assert(client);
+  sc6_input_control *view = MapViewOfFile(client, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(*view));
+  assert(view);
+  InterlockedExchange(&view->command, SC6_INPUT_A);
+  SetEvent(input_control_request);
+  input_control_frame(101, 10.1);
+  assert(WaitForSingleObject(input_control_done, 0) == WAIT_OBJECT_0);
+  assert(cfg_input_poll_hz == 0 && view->capturing && view->count == 1);
+  assert(cfg_input_latch == 1 && cfg_early_step == 1);
+  input_control_frame(102, 10.2);
+  assert(view->count == 2 && view->samples[1].battle == 102);
+  InterlockedExchange(&view->command, SC6_INPUT_STOP);
+  SetEvent(input_control_request);
+  input_control_frame(103, 10.3);
+  assert(WaitForSingleObject(input_control_done, 0) == WAIT_OBJECT_0);
+  assert(!view->capturing && view->count == 2);
+  InterlockedExchange(&view->command, SC6_INPUT_B);
+  SetEvent(input_control_request);
+  input_control_frame(104, 10.4);
+  assert(WaitForSingleObject(input_control_done, 0) == WAIT_OBJECT_0);
+  assert(cfg_input_poll_hz == 125 && view->capturing && view->count == 1);
+  view->count = SC6_INPUT_CAPTURE_MAX;
+  input_control_frame(105, 10.5);
+  assert(view->dropped == 1 && view->count == SC6_INPUT_CAPTURE_MAX);
+  InterlockedExchange(&view->command, SC6_INPUT_RESTORE);
+  SetEvent(input_control_request);
+  input_control_frame(106, 10.6);
+  assert(WaitForSingleObject(input_control_done, 0) == WAIT_OBJECT_0);
+  assert(cfg_input_poll_hz == 125 && !view->capturing);
+  /* Run the actual console client against this standalone test endpoint. */
+  char executable[MAX_PATH], temporary[MAX_PATH], capture[MAX_PATH], command_line[MAX_PATH * 3];
+  assert(GetModuleFileNameA(NULL, executable, sizeof(executable)));
+  char *slash = strrchr(executable, '\\');
+  assert(slash);
+  strcpy(slash + 1, "input-control.exe");
+  assert(GetTempPathA(sizeof(temporary), temporary));
+  assert(GetTempFileNameA(temporary, "sca", 0, capture));
+  view->count = view->dropped = 0;
+  view->capturing = 1;
+  input_control_frame(107, 10.7);
+  input_control_frame(108, 10.8);
+  snprintf(command_line, sizeof(command_line), "\"%s\" stop \"%s\" --pid %lu",
+           executable, capture, (unsigned long)GetCurrentProcessId());
+  STARTUPINFOA startup = { .cb = sizeof(startup) };
+  PROCESS_INFORMATION child;
+  assert(CreateProcessA(NULL, command_line, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child));
+  unsigned waited = 0;
+  while (WaitForSingleObject(child.hProcess, 0) == WAIT_TIMEOUT && waited++ < 500) {
+    input_control_frame(108, 10.8 + waited * 0.01);
+    Sleep(10);
+  }
+  assert(WaitForSingleObject(child.hProcess, 0) == WAIT_OBJECT_0);
+  DWORD exit_code;
+  assert(GetExitCodeProcess(child.hProcess, &exit_code) && exit_code == 0);
+  CloseHandle(child.hThread); CloseHandle(child.hProcess);
+  FILE *saved = fopen(capture, "r");
+  char line[512];
+  assert(saved && fgets(line, sizeof(line), saved) && strstr(line, "polling_target_hz=125"));
+  assert(fgets(line, sizeof(line), saved) && strstr(line, "frame_ms"));
+  assert(fgets(line, sizeof(line), saved));
+  fclose(saved);
+  DeleteFileA(capture);
+  assert(!view->capturing);
+  UnmapViewOfFile(view);
+  CloseHandle(client);
+  puts("Direct input controls, A/B rates, unchanged latch settings, capture bounds, stop, and restore passed.");
+}
+
 int main(void) {
   test_thread_names();
   test_gate_stub();
   test_input_hook();
+  test_input_control();
   uint8_t object[0x3A8] = {0};
   uint32_t *clock = (uint32_t *)(object + 0x3A4);
   uint8_t *cave = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);

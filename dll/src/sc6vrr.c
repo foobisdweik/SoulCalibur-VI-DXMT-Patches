@@ -50,6 +50,7 @@
 #include <tlhelp32.h>
 #include "MinHook.h"
 #include "measurements.h"
+#include "input_control.h"
 
 /* ---------- configuration and logging ---------------------------------- */
 
@@ -1035,9 +1036,11 @@ static SRWLOCK input_lock = SRWLOCK_INIT;
 static WORD poll_last[4], poll_pending[4];
 static unsigned poll_generation[4], xi_generation[4];
 static ULONGLONG poll_retry_at[4];
-static int cfg_input_poll_hz;
+static volatile LONG cfg_input_poll_hz;
 static volatile LONG input_poll_stop, input_poll_cycles;
 static int input_poll_started;
+static volatile LONG input_total_cycles;
+static uint32_t input_total_reads, input_total_presses, input_total_early;
 
 static WORD input_buttons(const sc6_xinput_state *st) {
   WORD b = st->buttons & ~(XI_LT | XI_RT);
@@ -1064,9 +1067,15 @@ static void input_observe(DWORD user, DWORD result, const sc6_xinput_state *st) 
 
 static DWORD WINAPI input_poll_main(LPVOID unused) {
   (void)unused;
-  double period = 1.0 / cfg_input_poll_hz;
   double next = qpc_seconds();
   while (!InterlockedCompareExchange(&input_poll_stop, 0, 0)) {
+    LONG hz = InterlockedCompareExchange(&cfg_input_poll_hz, 0, 0);
+    if (!hz) {
+      Sleep(10);
+      next = qpc_seconds();
+      continue;
+    }
+    double period = 1.0 / hz;
     for (DWORD user = 0; user < 4; user++) {
       sc6_xinput_state state;
       AcquireSRWLockExclusive(&input_lock);
@@ -1079,6 +1088,7 @@ static DWORD WINAPI input_poll_main(LPVOID unused) {
       ReleaseSRWLockExclusive(&input_lock);
     }
     InterlockedIncrement(&input_poll_cycles);
+    InterlockedIncrement(&input_total_cycles);
     next += period;
     double now = qpc_seconds();
     if (next < now) next = now + period; /* Do not burst after a stall. */
@@ -1093,7 +1103,7 @@ static DWORD WINAPI input_poll_main(LPVOID unused) {
 }
 
 static void start_input_poll(void) {
-  if (input_poll_started || !cfg_input_poll_hz || !orig_xinput_get_state) return;
+  if (input_poll_started || !orig_xinput_get_state) return;
   input_poll_started = 1;
   /* Keep the module loaded while its process-lifetime reader runs. */
   HMODULE pinned;
@@ -1205,6 +1215,7 @@ static DWORD WINAPI hook_xinput_get_state(DWORD user, sc6_xinput_state *st) {
   ReleaseSRWLockExclusive(&input_lock);
   int phase = input_phase;
   input_stats.reads++;
+  input_total_reads++;
   if (phase == 1)
     input_stats.before_world++;
   else if (phase == 2)
@@ -1219,8 +1230,10 @@ static DWORD WINAPI hook_xinput_get_state(DWORD user, sc6_xinput_state *st) {
     input_trace("trace X f=%lld step=%d pad=%lu buttons=%04x pending=%04x", (long long)g_frames, !g_skip_battle,
                 (unsigned long)user, b, pending);
   xi_last[user] = b;
-  if (down)
+  if (down) {
     input_stats.presses++;
+    input_total_presses++;
+  }
   if (cfg_input_latch) {
     xi_sticky[user] |= down;
     WORD extra = xi_sticky[user] & ~b; /* released again before a step read it */
@@ -1251,8 +1264,72 @@ static DWORD WINAPI hook_xinput_get_state(DWORD user, sc6_xinput_state *st) {
     gate_acc -= GATE_STEP;
     g_skip_battle = 0;
     input_stats.early++;
+    input_total_early++;
   }
   return r;
+}
+
+/* Explicit commands arrive through named events. The game thread applies
+ * them on the next frame. No file watcher or remote memory writes are used. */
+static sc6_input_control *input_control;
+static HANDLE input_control_map, input_control_request, input_control_done;
+static int input_control_attempted, input_saved_rate;
+
+static void input_control_frame(uint32_t battle, double now) {
+  if (!input_control_attempted) {
+    input_control_attempted = 1;
+    char name[128];
+    DWORD pid = GetCurrentProcessId();
+    sc6_input_object_name(name, sizeof(name), pid, "map");
+    input_control_map = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+                                         sizeof(sc6_input_control), name);
+    if (input_control_map)
+      input_control = MapViewOfFile(input_control_map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(*input_control));
+    sc6_input_object_name(name, sizeof(name), pid, "request");
+    input_control_request = CreateEventA(NULL, FALSE, FALSE, name);
+    sc6_input_object_name(name, sizeof(name), pid, "done");
+    input_control_done = CreateEventA(NULL, FALSE, FALSE, name);
+    if (!input_control || !input_control_request || !input_control_done) {
+      log_msg("input control: endpoint creation failed");
+      return;
+    }
+    memset(input_control, 0, sizeof(*input_control));
+    input_control->version = SC6_INPUT_CONTROL_VERSION;
+    input_control->pid = pid;
+    input_saved_rate = cfg_input_poll_hz;
+    log_msg("input control: ready pid=%lu; A=engine reads, B=125 Hz", (unsigned long)pid);
+  }
+  if (!input_control || !input_control_request || !input_control_done) return;
+  if (WaitForSingleObject(input_control_request, 0) == WAIT_OBJECT_0) {
+    LONG command = InterlockedCompareExchange(&input_control->command, 0, 0);
+    if (command == SC6_INPUT_A || command == SC6_INPUT_B) {
+      InterlockedExchange(&cfg_input_poll_hz, command == SC6_INPUT_A ? 0 : 125);
+      /* Discard pending background edges from the preceding condition.
+       * Leave the current held state and battle gate unchanged. */
+      AcquireSRWLockExclusive(&input_lock);
+      memset(poll_pending, 0, sizeof(poll_pending));
+      ReleaseSRWLockExclusive(&input_lock);
+      input_control->count = input_control->dropped = 0;
+      input_control->capturing = 1;
+    } else if (command == SC6_INPUT_STOP || command == SC6_INPUT_RESTORE) {
+      input_control->capturing = 0;
+      if (command == SC6_INPUT_RESTORE) InterlockedExchange(&cfg_input_poll_hz, input_saved_rate);
+    }
+    input_control->rate = cfg_input_poll_hz;
+    input_control->latch = cfg_input_latch;
+    input_control->early = cfg_early_step;
+    InterlockedExchange(&input_control->command, 0);
+    SetEvent(input_control_done);
+  }
+  if (input_control->capturing) {
+    uint32_t i = input_control->count;
+    if (i < SC6_INPUT_CAPTURE_MAX) {
+      input_control->samples[i] = (sc6_input_sample){now, battle,
+        (uint32_t)InterlockedCompareExchange(&input_total_cycles, 0, 0),
+        input_total_reads, input_total_presses, input_total_early};
+      input_control->count = i + 1;
+    } else input_control->dropped++;
+  }
 }
 
 /* Runs on the game thread once per frame, after the gate decision. */
@@ -1284,6 +1361,7 @@ static void input_frame(void) {
   if (in_battle != input_in_battle)
     log_msg("input: battle %s", in_battle ? "running" : "not running");
   input_in_battle = in_battle;
+  input_control_frame(c, qpc_seconds());
 }
 
 static void hook_world_tick(void *world, int tick_type, float delta) {

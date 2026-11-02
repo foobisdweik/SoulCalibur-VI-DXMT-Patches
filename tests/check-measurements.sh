@@ -6,6 +6,7 @@ cd "$repo"
 python3 -I -m unittest discover -s tests -p 'test_*.py' -v
 zsh -n tests/run.sh tests/summarize.sh tests/mark.sh
 dll/build.sh
+tools/input-control/build.sh
 clang -std=c11 -Wall -Wextra -Werror tests/test_durations.c -o dll/build/test-durations
 dll/build/test-durations
 x86_64-w64-mingw32-gcc -O2 -Wall -o dll/build/test-clock-cave.exe \
