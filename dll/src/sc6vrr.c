@@ -989,7 +989,7 @@ static int install_frame_timers(void) {
  * (FUN_1403fcd10), and "pressed" is (previous word ^ this word) & this word,
  * so it compares two step samples. UE4 reads the pad with XInputGetState once
  * per engine frame (120 times per second at 120 fps), but the battle only uses
- * the reads on frames that run a step. A background reader targets 250 Hz
+ * the reads on frames that run a step. A background reader targets 125 Hz
  * by default, independently of rendering, and retains observed presses.
  * Two options use the reads between steps:
  *  - SC6VRR_INPUT_LATCH=1: a button that goes down is reported as held until
@@ -5057,7 +5057,7 @@ static void setup(void) {
   cfg_input_latch = env_int("SC6VRR_INPUT_LATCH", 1);
   cfg_early_step = env_int("SC6VRR_EARLY_STEP", 1);
   cfg_input_trace = env_int("SC6VRR_INPUT_TRACE", 0);
-  cfg_input_poll_hz = env_int("SC6VRR_INPUT_POLL_HZ", 250);
+  cfg_input_poll_hz = env_int("SC6VRR_INPUT_POLL_HZ", 125);
   if (cfg_input_poll_hz < 0) cfg_input_poll_hz = 0;
   if (cfg_input_poll_hz > 1000) cfg_input_poll_hz = 1000;
   if ((cfg_input_latch || cfg_early_step) && !cfg_gate) {

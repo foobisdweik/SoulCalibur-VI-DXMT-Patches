@@ -217,7 +217,7 @@ static void test_input_hook(void) {
 
   /* The reader runs without engine frames and never changes the gate. */
   fake_pad_buttons = 0;
-  cfg_input_poll_hz = 250;
+  cfg_input_poll_hz = 125;
   fake_pad_reads = 0;
   input_poll_stop = 0;
   g_skip_battle = 1;

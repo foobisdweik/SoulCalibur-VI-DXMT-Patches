@@ -10,10 +10,10 @@ The implementation now does the following:
 
 1. It clears retained input when a controller disconnects, including a reconnect before the next engine read.
 2. It removes the mod's online-status checks because this installation is for offline play.
-3. It adds an independent reader with a default target of 250 reads/s for each of four controller slots.
+3. It adds an independent reader with a default target of 125 reads/s for each of four controller slots.
 4. It leaves GPU waits unchanged because their effect on input latency remains unmeasured and has lower priority.
 
-`SC6VRR_INPUT_POLL_HZ` selects the target rate. Use `120` for 120 reads/s, or `0` for engine reads only.
+`SC6VRR_INPUT_POLL_HZ` selects the target rate. Use `125` for 125 reads/s, or `0` for engine reads only.
 The maximum is 1,000 reads/s. The OS can delay wakeups, so these values are targets.
 The log reports completed polling cycles each second through `poll_cycles`.
 One cycle checks four slots, but disconnected slots retry only once per second to avoid repeated device enumeration.
