@@ -59,6 +59,11 @@ static cl::opt<unsigned> IndexFormat(
   "index-format", cl::init(0), cl::desc("Index buffer format for vertex pulling: 0 none, 1 uint16, 2 uint32")
 );
 
+static cl::opt<bool> GSLayered(
+  "gs-layered", cl::init(false),
+  cl::desc("With --geometry-after-vertex: build the layered GS vertex function (vertex + GS in one vertex function)")
+);
+
 static cl::opt<bool>
   StripTopology("strip-topology", cl::init(false), cl::desc("The geometry pipeline draws a strip topology"));
 
@@ -409,7 +414,18 @@ int main(int argc, char **argv) {
       return 1;
     }
     geometry.next = &ia_layout;
-    if (auto err = dxmt::dxbc::convert_dxbc_vertex_for_geometry_shader(
+    if (GSLayered) {
+      auto layered_faces = ((dxmt::dxbc::SM50ShaderInternal *)sm50_geometry)->gs_layered_faces;
+      errs() << "layered faces: " << layered_faces << '\n';
+      if (!layered_faces)
+        return 1;
+    }
+    if (auto err = GSLayered ? dxmt::dxbc::convert_dxbc_vertex_for_layered_geometry_shader(
+                                 (dxmt::dxbc::SM50ShaderInternal *)sm50, "shader_main",
+                                 (dxmt::dxbc::SM50ShaderInternal *)sm50_geometry, Context, M,
+                                 (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&ia_layout
+                             )
+                             : dxmt::dxbc::convert_dxbc_vertex_for_geometry_shader(
           (dxmt::dxbc::SM50ShaderInternal *)sm50, "shader_main",
           (dxmt::dxbc::SM50ShaderInternal *)sm50_geometry, Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&geometry
         )) {

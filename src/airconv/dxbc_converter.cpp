@@ -996,6 +996,8 @@ AIRCONV_API int SM50Initialize(
   }
 
   sm50_shader->bbs = read_control_flow(CodeParser, sm50_shader.get(), inputParser, outputParser);
+  if (sm50_shader->shader_type == microsoft::D3D10_SB_GEOMETRY_SHADER)
+    analyze_dxbc_layered_geometry_shader(sm50_shader.get(), outputParser);
 
   auto &binding_table = shader_info->binding_table;
   auto &binding_table_cbuffer = shader_info->binding_table_cbuffer;
@@ -1248,6 +1250,8 @@ AIRCONV_API int SM50Initialize(
         pRefl->GeometryShader.GSPassThrough = ~0u;
       }
       pRefl->GeometryShader.Primitive = sm50_shader->gs_input_primitive;
+      pRefl->GeometryShader.LayeredFaces =
+          pRefl->GeometryShader.GSPassThrough == ~0u ? sm50_shader->gs_layered_faces : 0;
     }
     if (sm50_shader->shader_type == microsoft::D3D10_SB_PIXEL_SHADER) {
       pRefl->PixelShader.ValidRenderTargets = sm50_shader->pso_valid_output_reg_mask;
@@ -1489,18 +1493,27 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
   auto pModule = std::make_unique<Module>("shader.air", context);
   initializeModule(*pModule);
 
-  if (auto err = dxmt::dxbc::convert_dxbc_vertex_for_geometry_shader(
-        (dxbc::SM50ShaderInternal *)pVertexShader, FunctionName,
-        (dxbc::SM50ShaderInternal *)pGeometryShader, context, *pModule,
-        pVertexShaderArgs
-      )) {
+  SM50_SHADER_GS_LAYERED_DATA *layered = nullptr;
+  args_get_data<SM50_SHADER_GS_LAYERED, SM50_SHADER_GS_LAYERED_DATA>(pVertexShaderArgs, &layered);
+  if (auto err = layered ? dxmt::dxbc::convert_dxbc_vertex_for_layered_geometry_shader(
+                             (dxbc::SM50ShaderInternal *)pVertexShader, FunctionName,
+                             (dxbc::SM50ShaderInternal *)pGeometryShader, context, *pModule, pVertexShaderArgs
+                         )
+                       : dxmt::dxbc::convert_dxbc_vertex_for_geometry_shader(
+                             (dxbc::SM50ShaderInternal *)pVertexShader, FunctionName,
+                             (dxbc::SM50ShaderInternal *)pGeometryShader, context, *pModule,
+                             pVertexShaderArgs
+                         )) {
     errorOut << llvm::toString(std::move(err));
     SM50_RETURN_ERROR(errorObj, ppError, 1);
   }
 
-  if (shader_info.use_msad)
+  /* The object function runs the vertex shader code, so the vertex shader's
+     helper functions must be linked too. */
+  auto &vs_shader_info = ((dxmt::dxbc::SM50ShaderInternal *)pVertexShader)->shader_info;
+  if (shader_info.use_msad || vs_shader_info.use_msad)
     linkMSAD(*pModule);
-  if (shader_info.use_samplepos)
+  if (shader_info.use_samplepos || vs_shader_info.use_samplepos)
     linkSamplePos(*pModule);
 
   runOptimizationPasses(*pModule);

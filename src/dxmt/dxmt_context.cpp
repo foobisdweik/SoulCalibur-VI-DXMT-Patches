@@ -198,6 +198,10 @@ template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Vert
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
     uint64_t argument_buffer_offset
 );
+template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Geometry, PipelineKind::Ordinary>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
+    uint64_t argument_buffer_offset
+);
 template void ArgumentEncodingContext::encodeConstantBuffers<PipelineStage::Geometry, PipelineKind::Geometry>(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *constant_buffers,
     uint64_t argument_buffer_offset
@@ -259,7 +263,12 @@ ArgumentEncodingContext::encodeConstantBuffers(const MTL_SHADER_REFLECTION *refl
     } else if constexpr (stage == PipelineStage::Domain) {
       cmd.type = WMTRenderCommandSetMeshBufferOffset;
     } else if constexpr (stage == PipelineStage::Geometry) {
-      cmd.type = WMTRenderCommandSetMeshBufferOffset;
+      if constexpr (kind == PipelineKind::Ordinary) {
+        /* layered geometry shader: the GS code runs in the vertex function */
+        cmd.type = WMTRenderCommandSetVertexBufferOffset;
+        cmd.index = SM50_BINDING_INDEX_CONSTANT_BUFFER2;
+      } else
+        cmd.type = WMTRenderCommandSetMeshBufferOffset;
     } else {
       assert(0 && "Not implemented or unreachable");
     }
@@ -288,6 +297,9 @@ template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Comp
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Vertex, PipelineKind::Geometry>(
+    const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset
+);
+template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Geometry, PipelineKind::Ordinary>(
     const MTL_SHADER_REFLECTION *reflection, const MTL_SM50_SHADER_ARGUMENT *arguments, uint64_t argument_buffer_offset
 );
 template void ArgumentEncodingContext::encodeShaderResources<PipelineStage::Geometry, PipelineKind::Geometry>(
@@ -448,7 +460,12 @@ ArgumentEncodingContext::encodeShaderResources(
     } else if constexpr (stage == PipelineStage::Domain) {
       cmd.type = WMTRenderCommandSetMeshBufferOffset;
     } else if constexpr (stage == PipelineStage::Geometry) {
-      cmd.type = WMTRenderCommandSetMeshBufferOffset;
+      if constexpr (kind == PipelineKind::Ordinary) {
+        /* layered geometry shader: the GS code runs in the vertex function */
+        cmd.type = WMTRenderCommandSetVertexBufferOffset;
+        cmd.index = SM50_BINDING_INDEX_ARGUMENT_TABLE2;
+      } else
+        cmd.type = WMTRenderCommandSetMeshBufferOffset;
     } else {
       assert(0 && "Not implemented or unreachable");
     }
@@ -868,15 +885,81 @@ constexpr unsigned kEncoderOptimizerThreshold = 64;
  * attachment of every render pass: its size, texel size, and load and store
  * actions. A load reads the image from memory into the GPU's on-chip tiles
  * and a store writes it back, so these rows show how much memory traffic the
- * passes cause. Off when the variable is unset. */
+ * passes cause. Each row also has the number of draws in the pass and the
+ * IDs of its pixel shaders ("+" at the end means more than 8), so a pass can
+ * be matched to the game effect that draws it. The last three columns split
+ * the draws by how DXMT runs them: draws_gs uses DXMT's geometry-shader
+ * emulation, draws_tess uses its tessellation emulation, and draws_mesh is a
+ * plain mesh-shader draw. Both emulations run on Metal mesh shaders, which
+ * cost extra GPU work. Off when the variable is unset. */
 static FILE *sc6_pass_file;
 static uint64_t sc6_pass_every;
 static bool sc6_pass_checked;
 static uint64_t sc6_pass_frame = ~0ull;
 static unsigned sc6_pass_ordinal;
 
+/* SC6 local: when DXMT_SC6_PASS_LABELS=1, name every render encoder after its
+ * target size, the pixel format of its first attachment, and its draw counts
+ * ("64x64 f115 d2 gs2"). Instruments' Metal System Trace shows these names, so
+ * GPU time can be matched to a pass without guessing from encoder order. */
 static void
-sc6_log_pass(uint64_t frame_id, uint64_t seq_id, const WMTRenderPassInfo &info, unsigned readonly) {
+sc6_label_pass(WMT::RenderCommandEncoder &encoder, const WMTRenderPassInfo &info, const RenderEncoderData &data) {
+  static int enabled = -1;
+  if (enabled < 0)
+    enabled = env::getEnvVar("DXMT_SC6_PASS_LABELS") == "1";
+  if (!enabled)
+    return;
+  unsigned draws = 0, draws_gs = 0;
+  // Size of the first draw: vertex or index count, then instance count. A
+  // one-draw pass with high vertex time is either instanced or a heavy shader.
+  unsigned long long first_count = 0, first_inst = 0;
+  for (auto cmd = (const wmtcmd_base *)data.cmd_head.next.ptr; cmd; cmd = (const wmtcmd_base *)cmd->next.ptr) {
+    if (!draws && cmd->type == WMTRenderCommandDraw) {
+      auto d = (const wmtcmd_render_draw *)cmd;
+      first_count = d->vertex_count;
+      first_inst = d->instance_count;
+    } else if (!draws && cmd->type == WMTRenderCommandDrawIndexed) {
+      auto d = (const wmtcmd_render_draw_indexed *)cmd;
+      first_count = d->index_count;
+      first_inst = d->instance_count;
+    }
+    switch (cmd->type) {
+    case WMTRenderCommandDXMTGeometryDraw:
+    case WMTRenderCommandDXMTGeometryDrawIndexed:
+    case WMTRenderCommandDXMTGeometryDrawIndirect:
+    case WMTRenderCommandDXMTGeometryDrawIndexedIndirect:
+      draws_gs++;
+      [[fallthrough]];
+    case WMTRenderCommandDraw:
+    case WMTRenderCommandDrawIndexed:
+    case WMTRenderCommandDrawIndirect:
+    case WMTRenderCommandDrawIndexedIndirect:
+    case WMTRenderCommandDrawMeshThreadgroups:
+    case WMTRenderCommandDrawMeshThreadgroupsIndirect:
+    case WMTRenderCommandDXMTTessellationMeshDraw:
+    case WMTRenderCommandDXMTTessellationMeshDrawIndexed:
+    case WMTRenderCommandDXMTTessellationMeshDrawIndirect:
+    case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect:
+      draws++;
+      break;
+    default:
+      break;
+    }
+  }
+  obj_handle_t tex = 0;
+  for (unsigned i = 0; i < 8 && !tex; i++)
+    tex = info.colors[i].texture;
+  if (!tex)
+    tex = info.depth.texture;
+  char label[96];
+  snprintf(label, sizeof(label), "%ux%u f%u d%u gs%u v%llux%llu", info.render_target_width, info.render_target_height,
+           tex ? (unsigned)MTLTexture_pixelFormat(tex) : 0u, draws, draws_gs, first_count, first_inst);
+  encoder.setLabel(WMT::String::string(label, WMTUTF8StringEncoding));
+}
+
+static void
+sc6_log_pass(uint64_t frame_id, uint64_t seq_id, const WMTRenderPassInfo &info, unsigned readonly,
+             const RenderEncoderData &data) {
   if (!sc6_pass_checked) {
     sc6_pass_checked = true;
     auto path = env::getEnvVar("DXMT_SC6_PASS_STATS");
@@ -885,7 +968,8 @@ sc6_log_pass(uint64_t frame_id, uint64_t seq_id, const WMTRenderPassInfo &info, 
       auto every = env::getEnvVar("DXMT_SC6_PASS_EVERY");
       sc6_pass_every = every.empty() ? 240 : std::max<uint64_t>(1, strtoull(every.c_str(), nullptr, 10));
       if (sc6_pass_file)
-        fprintf(sc6_pass_file, "frame\tseq\tpass\tslot\tformat\ttexel_bytes\twidth\theight\tsamples\tload\tstore\treadonly\n");
+        fprintf(sc6_pass_file, "frame\tseq\tpass\tslot\tformat\ttexel_bytes\twidth\theight\tsamples\tload\tstore\treadonly"
+                "\tdraws\tps\tdraws_gs\tdraws_tess\tdraws_mesh\n");
     }
   }
   if (!sc6_pass_file || frame_id % sc6_pass_every)
@@ -897,12 +981,54 @@ sc6_log_pass(uint64_t frame_id, uint64_t seq_id, const WMTRenderPassInfo &info, 
     sc6_pass_ordinal = 0;
   }
   unsigned pass = sc6_pass_ordinal++;
+  // Count the draw commands by walking the pass's command list. This runs
+  // only on logged frames, so the walk costs nothing on other frames.
+  unsigned draws = 0, draws_gs = 0, draws_tess = 0, draws_mesh = 0;
+  for (auto cmd = (const wmtcmd_base *)data.cmd_head.next.ptr; cmd; cmd = (const wmtcmd_base *)cmd->next.ptr) {
+    switch (cmd->type) {
+    case WMTRenderCommandDraw:
+    case WMTRenderCommandDrawIndexed:
+    case WMTRenderCommandDrawIndirect:
+    case WMTRenderCommandDrawIndexedIndirect:
+      draws++;
+      break;
+    case WMTRenderCommandDrawMeshThreadgroups:
+    case WMTRenderCommandDrawMeshThreadgroupsIndirect:
+      draws++;
+      draws_mesh++;
+      break;
+    case WMTRenderCommandDXMTGeometryDraw:
+    case WMTRenderCommandDXMTGeometryDrawIndexed:
+    case WMTRenderCommandDXMTGeometryDrawIndirect:
+    case WMTRenderCommandDXMTGeometryDrawIndexedIndirect:
+      draws++;
+      draws_gs++;
+      break;
+    case WMTRenderCommandDXMTTessellationMeshDraw:
+    case WMTRenderCommandDXMTTessellationMeshDrawIndexed:
+    case WMTRenderCommandDXMTTessellationMeshDrawIndirect:
+    case WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect:
+      draws++;
+      draws_tess++;
+      break;
+    default:
+      break;
+    }
+  }
+  char ps[8 * 17 + 2] = "-";
+  {
+    char *p = ps;
+    for (unsigned i = 0; i < data.sc6_ps_count; i++)
+      p += snprintf(p, ps + sizeof(ps) - p, "%s%016llx", i ? "," : "", (unsigned long long)data.sc6_ps_ids[i]);
+    if (data.sc6_ps_overflow)
+      snprintf(p, ps + sizeof(ps) - p, "+");
+  }
   auto row = [&](const char *slot, obj_handle_t tex, int load, int store) {
     auto format = MTLTexture_pixelFormat(tex);
-    fprintf(sc6_pass_file, "%llu\t%llu\t%u\t%s\t%u\t%u\t%u\t%u\t%u\t%d\t%d\t%u\n", (unsigned long long)frame_id,
+    fprintf(sc6_pass_file, "%llu\t%llu\t%u\t%s\t%u\t%u\t%u\t%u\t%u\t%d\t%d\t%u\t%u\t%s\t%u\t%u\t%u\n", (unsigned long long)frame_id,
             (unsigned long long)seq_id, pass, slot, (unsigned)format, MTLGetTexelSize(format),
             info.render_target_width, info.render_target_height, (unsigned)info.default_raster_sample_count, load,
-            store, readonly);
+            store, readonly, draws, ps, draws_gs, draws_tess, draws_mesh);
   };
   static const char *const names[8] = {"c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7"};
   for (unsigned i = 0; i < 8; i++)
@@ -1015,9 +1141,10 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
         assert(readbacks.visibility);
         render_pass_info.visibility_buffer = readbacks.visibility->visibility_result_heap;
       }
-      sc6_log_pass(frame_id_, seq_id_, render_pass_info, data->dsv_readonly_flags);
+      sc6_log_pass(frame_id_, seq_id_, render_pass_info, data->dsv_readonly_flags, *data);
       auto gpu_buffer_ = data->allocated_argbuf;
       auto encoder = cmdbuf.renderCommandEncoder(render_pass_info);
+      sc6_label_pass(encoder, render_pass_info, *data);
       data->fence_wait.forEach(
           data->fence_wait_vertex, // if a fence is waited pre-raster, no need to wait again at fragment
           [&](auto id) { encoder.waitForFence(fence_pool_[id], WMTRenderStagePreRaster); },

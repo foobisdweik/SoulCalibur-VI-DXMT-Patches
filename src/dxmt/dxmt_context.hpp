@@ -210,6 +210,24 @@ struct RenderEncoderData : EncoderData {
   bool use_emulated_so = 0;
   TileBarrierPSOKey tile_barrier_pso_key = {};
   WMT::RenderPipelineState last_pso = {};
+  /* SC6 fork: the distinct pixel shaders bound in this pass, for the pass
+   * log. Each ID is the first 8 bytes of the shader's SHA-1, so the same
+   * shader has the same ID in every frame and every run. 0 means no pixel
+   * shader (a depth-only draw). */
+  std::array<uint64_t, 8> sc6_ps_ids = {};
+  uint8_t sc6_ps_count = 0;
+  bool sc6_ps_overflow = false;
+
+  void
+  sc6NotePS(uint64_t id) {
+    for (unsigned i = 0; i < sc6_ps_count; i++)
+      if (sc6_ps_ids[i] == id)
+        return;
+    if (sc6_ps_count < sc6_ps_ids.size())
+      sc6_ps_ids[sc6_ps_count++] = id;
+    else
+      sc6_ps_overflow = true;
+  }
 };
 
 struct ComputeEncoderData : EncoderData {
@@ -306,6 +324,9 @@ GetResidencyMask(PipelineStage type, bool read, bool write) {
     return (read ? DXMT_RESOURCE_RESIDENCY_OBJECT_READ : DXMT_RESOURCE_RESIDENCY_NULL) |
            (write ? DXMT_RESOURCE_RESIDENCY_OBJECT_WRITE : DXMT_RESOURCE_RESIDENCY_NULL);
   case PipelineStage::Geometry:
+    if constexpr (kind == PipelineKind::Ordinary) // layered geometry shader
+      return (read ? DXMT_RESOURCE_RESIDENCY_VERTEX_READ : DXMT_RESOURCE_RESIDENCY_NULL) |
+             (write ? DXMT_RESOURCE_RESIDENCY_VERTEX_WRITE : DXMT_RESOURCE_RESIDENCY_NULL);
     return (read ? DXMT_RESOURCE_RESIDENCY_MESH_GS_READ : DXMT_RESOURCE_RESIDENCY_NULL) |
            (write ? DXMT_RESOURCE_RESIDENCY_MESH_GS_WRITE : DXMT_RESOURCE_RESIDENCY_NULL);
   case PipelineStage::Domain:

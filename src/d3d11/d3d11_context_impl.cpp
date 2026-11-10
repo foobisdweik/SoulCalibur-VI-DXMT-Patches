@@ -45,6 +45,17 @@
 
 namespace dxmt {
 
+/* SC6 fork: a stable 64-bit ID for a shader, for the pass log. It is the
+ * first 8 bytes of the shader's SHA-1, or 0 when no shader is bound. */
+static inline uint64_t
+sc6ShaderId(ManagedShader shader) {
+  if (!shader)
+    return 0;
+  uint64_t id;
+  memcpy(&id, shader->sha1().data, sizeof(id));
+  return id;
+}
+
 template<typename Object> Rc<Object> forward_rc(Rc<Object>& obj);
 
 inline bool
@@ -1311,7 +1322,8 @@ public:
     if (status == DrawCallStatus::Tessellation) {
       return TessellationDraw(ControlPointCount, VertexCount, 1, StartVertexLocation, 0);
     }
-    EmitOP([Primitive, StartVertexLocation, VertexCount](ArgumentEncodingContext& enc) {
+    EmitOP([Primitive, StartVertexLocation, VertexCount,
+            Faces = std::max(1u, gs_layered_faces_)](ArgumentEncodingContext& enc) {
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw>();
@@ -1320,7 +1332,7 @@ public:
       cmd.vertex_start = StartVertexLocation;
       cmd.vertex_count = VertexCount;
       cmd.base_instance = 0;
-      cmd.instance_count = 1;
+      cmd.instance_count = Faces;
     });
   }
 
@@ -1349,7 +1361,8 @@ public:
     auto IndexBufferOffset =
         state_.InputAssembler.IndexBufferOffset +
         StartIndexLocation * (state_.InputAssembler.IndexBufferFormat == DXGI_FORMAT_R32_UINT ? 4 : 2);
-    EmitOP([IndexType, IndexBufferOffset, Primitive, IndexCount, BaseVertexLocation](ArgumentEncodingContext &enc) {
+    EmitOP([IndexType, IndexBufferOffset, Primitive, IndexCount, BaseVertexLocation,
+            Faces = std::max(1u, gs_layered_faces_)](ArgumentEncodingContext &enc) {
       enc.bumpVisibilityResultOffset();
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
       enc.resolveRenderPassBarrier();
@@ -1362,7 +1375,7 @@ public:
       cmd.index_buffer_offset = IndexBufferOffset + index_sub_offset;
       cmd.base_vertex = BaseVertexLocation;
       cmd.base_instance = 0;
-      cmd.instance_count = 1;
+      cmd.instance_count = Faces;
     });
   }
 
@@ -1390,7 +1403,7 @@ public:
       );
     }
     EmitOP([Primitive, StartVertexLocation, VertexCountPerInstance, InstanceCount,
-          StartInstanceLocation](ArgumentEncodingContext &enc) {
+          StartInstanceLocation, Faces = std::max(1u, gs_layered_faces_)](ArgumentEncodingContext &enc) {
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw>();
@@ -1398,8 +1411,8 @@ public:
       cmd.primitive_type = Primitive;
       cmd.vertex_start = StartVertexLocation;
       cmd.vertex_count = VertexCountPerInstance;
-      cmd.instance_count = InstanceCount;
-      cmd.base_instance = StartInstanceLocation;
+      cmd.instance_count = InstanceCount * Faces;
+      cmd.base_instance = StartInstanceLocation * Faces;
     });
   }
 
@@ -1437,7 +1450,7 @@ public:
         state_.InputAssembler.IndexBufferOffset +
         StartIndexLocation * (state_.InputAssembler.IndexBufferFormat == DXGI_FORMAT_R32_UINT ? 4 : 2);
     EmitOP([IndexType, IndexBufferOffset, Primitive, InstanceCount, BaseVertexLocation, StartInstanceLocation,
-          IndexCountPerInstance](ArgumentEncodingContext &enc) {
+          IndexCountPerInstance, Faces = std::max(1u, gs_layered_faces_)](ArgumentEncodingContext &enc) {
       enc.bumpVisibilityResultOffset();
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
       enc.resolveRenderPassBarrier();
@@ -1449,8 +1462,8 @@ public:
       cmd.index_buffer = index_buffer;
       cmd.index_buffer_offset = IndexBufferOffset + index_sub_offset;
       cmd.base_vertex = BaseVertexLocation;
-      cmd.base_instance = StartInstanceLocation;
-      cmd.instance_count = InstanceCount;
+      cmd.base_instance = StartInstanceLocation * Faces;
+      cmd.instance_count = InstanceCount * Faces;
     });
   }
 
@@ -1617,7 +1630,7 @@ public:
     uint32_t ControlPointCount;
     if(!to_metal_primitive_type(state_.InputAssembler.Topology, Primitive, ControlPointCount))
       return;
-    DrawCallStatus status = PreDraw<true>();
+    DrawCallStatus status = PreDraw<true, false>();
     if (status == DrawCallStatus::Invalid)
       return;
     if (status == DrawCallStatus::Geometry) {
@@ -1659,7 +1672,7 @@ public:
     uint32_t ControlPointCount;
     if(!to_metal_primitive_type(state_.InputAssembler.Topology, Primitive, ControlPointCount))
       return;
-    DrawCallStatus status = PreDraw<false>();
+    DrawCallStatus status = PreDraw<false, false>();
     if (status == DrawCallStatus::Invalid)
       return;
     if (status == DrawCallStatus::Geometry) {
@@ -4741,9 +4754,10 @@ public:
       return DrawCallStatus::Invalid;
     }
 
-    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext &enc) {
+    EmitST([pso = std::move(pipeline), sc6_ps = sc6ShaderId(pipelineDesc.PixelShader)](ArgumentEncodingContext &enc) {
       auto render_encoder = enc.currentRenderEncoder();
       render_encoder->use_tessellation = 1;
+      render_encoder->sc6NotePS(sc6_ps);
       MTL_COMPILED_TESSELLATION_MESH_PIPELINE GraphicsPipeline{};
       pso->GetPipeline(&GraphicsPipeline); // may block
       enc.tess_num_output_control_point_element = GraphicsPipeline.NumControlPointOutputElement;
@@ -4789,9 +4803,10 @@ public:
     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
     device->CreateGeometryPipeline(&pipelineDesc, &pipeline);
-    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext& enc) {
+    EmitST([pso = std::move(pipeline), sc6_ps = sc6ShaderId(pipelineDesc.PixelShader)](ArgumentEncodingContext& enc) {
       auto render_encoder = enc.currentRenderEncoder();
       render_encoder->use_geometry = 1;
+      render_encoder->sc6NotePS(sc6_ps);
       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
       pso->GetPipeline(&GraphicsPipeline); // may block
       if (!GraphicsPipeline.PipelineState)
@@ -4822,18 +4837,45 @@ public:
   Assume we have all things needed to build PSO
   If the current encoder is not a render encoder, switch to it.
   */
-  template <bool IndexedDraw>
+  /* Face count if the bound geometry shader can run as a layered vertex
+     function (see dxbc_converter_gs_layered.cpp), else 0. */
+  uint32_t
+  LayeredGeometryShaderFaces(const ManagedShader &GS) {
+    static const bool enabled = env::getEnvVar("DXMT_SC6_GS_LAYERED") != "0";
+    if (!enabled)
+      return 0;
+    if (state_.InputAssembler.Topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+      return 0;
+    if (com_cast<IMTLD3D11StreamOutputLayout>(state_.ShaderStages[PipelineStage::Geometry].Shader.ptr()))
+      return 0;
+    return GS->reflection().GeometryShader.LayeredFaces;
+  }
+
+  template <bool IndexedDraw, bool AllowLayeredGS = true>
   DrawCallStatus
   FinalizeCurrentRenderPipeline() {
     if (state_.ShaderStages[PipelineStage::Hull].Shader) {
       return FinalizeTessellationRenderPipeline<IndexedDraw>();
     }
-    if (cmdbuf_state == CommandBufferState::RenderPipelineReady)
-      return DrawCallStatus::Ordinary;
+    if (cmdbuf_state == CommandBufferState::RenderPipelineReady) {
+      if (AllowLayeredGS || !gs_layered_faces_)
+        return DrawCallStatus::Ordinary;
+      /* An indirect draw cannot multiply its instance count, so it uses the
+         general geometry shader path. */
+      InvalidateRenderPipeline();
+    }
     auto GS = GetManagedShader<PipelineStage::Geometry>();
+    uint32_t layered_faces = 0;
     if (GS) {
       if (GS->reflection().GeometryShader.GSPassThrough == ~0u) {
-        return FinalizeGeometryRenderPipeline<IndexedDraw>();
+        layered_faces = AllowLayeredGS ? LayeredGeometryShaderFaces(GS) : 0;
+        if (!layered_faces) {
+          gs_layered_faces_ = 0;
+          return FinalizeGeometryRenderPipeline<IndexedDraw>();
+        }
+        /* Leaving the general geometry pipeline (after an indirect draw):
+           record it, so the vertex stage bindings are uploaded again. */
+        InvalidateRenderPipeline();
       }
     }
 
@@ -4845,9 +4887,12 @@ public:
 
     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
+    if (layered_faces)
+      pipelineDesc.GSPassthrough = kGSLayered;
 
     device->CreateGraphicsPipeline(&pipelineDesc, &pipeline);
-    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext& enc) {
+    EmitST([pso = std::move(pipeline), sc6_ps = sc6ShaderId(pipelineDesc.PixelShader)](ArgumentEncodingContext& enc) {
+      enc.currentRenderEncoder()->sc6NotePS(sc6_ps);
       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
       pso->GetPipeline(&GraphicsPipeline); // may block
       if (!GraphicsPipeline.PipelineState)
@@ -4867,11 +4912,19 @@ public:
       state_.ShaderStages[PipelineStage::Vertex].Samplers.set_dirty();
       previous_render_pipeline_state = CommandBufferState::RenderPipelineReady;
     }
+    /* The GS bindings of a layered pipeline go to vertex stage slots, which
+       other pipelines may have changed. Upload them again. */
+    if (layered_faces) {
+      state_.ShaderStages[PipelineStage::Geometry].ConstantBuffers.set_dirty();
+      state_.ShaderStages[PipelineStage::Geometry].SRVs.set_dirty();
+      state_.ShaderStages[PipelineStage::Geometry].Samplers.set_dirty();
+    }
+    gs_layered_faces_ = layered_faces;
 
     return DrawCallStatus::Ordinary;
   }
 
-  template <bool IndexedDraw>
+  template <bool IndexedDraw, bool AllowLayeredGS = true>
   DrawCallStatus
   PreDraw() {
     DrawCallStatus status;
@@ -4879,7 +4932,7 @@ public:
       if (!state_.InputAssembler.IndexBuffer)
         return DrawCallStatus::Invalid;
     }
-    if (status = FinalizeCurrentRenderPipeline<IndexedDraw>(); status == DrawCallStatus::Invalid) {
+    if (status = FinalizeCurrentRenderPipeline<IndexedDraw, AllowLayeredGS>(); status == DrawCallStatus::Invalid) {
       return status;
     }
     UpdateVertexBuffer();
@@ -4978,6 +5031,8 @@ public:
     } else {
       UploadShaderStageResourceBinding<PipelineStage::Vertex, PipelineKind::Ordinary>();
       UploadShaderStageResourceBinding<PipelineStage::Pixel, PipelineKind::Ordinary>();
+      if (gs_layered_faces_)
+        UploadShaderStageResourceBinding<PipelineStage::Geometry, PipelineKind::Ordinary>();
     }
     return status;
   }
@@ -5144,6 +5199,9 @@ public:
 protected:
   MTLD3D11Device *device;
   CommandBufferState cmdbuf_state = CommandBufferState::Idle;
+  /* Faces of the layered geometry shader in the current ordinary pipeline,
+     or 0. Each D3D instance becomes this many Metal instances. */
+  uint32_t gs_layered_faces_ = 0;
   CommandBufferState previous_render_pipeline_state = CommandBufferState::Idle;
   ContextInternalState &ctx_state;
   ContextInternalState::device_mutex_t &mutex;

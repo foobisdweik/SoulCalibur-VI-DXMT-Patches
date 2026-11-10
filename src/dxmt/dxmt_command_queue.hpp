@@ -253,12 +253,20 @@ public:
     return frame_count + 1;
   }
 
+  // SC6 local: one line per presented frame, when DXMT_SC6_FRAME_LOG names a file.
+  // Pass counts and encode times are added on the encoder thread, which runs behind
+  // Present. So each line carries the stats of the frame kSc6StatsLag frames back,
+  // which has finished encoding but whose slot (of 16) has not been reused yet.
+  static constexpr uint64_t kSc6StatsLag = 8;
+  static void sc6LogFrame(uint64_t frame, const FrameStatistics *lagged);
+
   FrameStatistics& CurrentFrameStatistics() {
     return statistics.at(frame_count);
   }
 
   void
   PresentBoundary() {
+    sc6LogFrame(frame_count, frame_count >= kSc6StatsLag ? &statistics.at(frame_count - kSc6StatsLag) : nullptr);
     statistics.compute(frame_count);
     frame_count++;
     statistics.at(frame_count).reset();

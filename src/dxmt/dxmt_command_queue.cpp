@@ -23,6 +23,8 @@
 #include "util_env.hpp"
 #include "util_win32_compat.h"
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 
 #define ASYNC_ENCODING 1
 
@@ -137,11 +139,18 @@ CommandQueue::CommitChunkInternal(CommandChunk &chunk, uint64_t seq) {
     info.output_url.set(fileUrl.c_str());
 
     capture_mgr.startCapture(info);
+    sc6PlayCaptureSound("DXMT_SC6_CAPTURE_SOUND_START");
     break;
   }
   case CaptureState::NextAction::StopCapture: {
     auto capture_mgr = WMT::CaptureManager::sharedCaptureManager();
+    // The "done" sound plays after stopCapture returns. The logged duration
+    // shows whether stopCapture blocks while Metal writes the .gputrace.
+    auto t0 = clock::now();
     capture_mgr.stopCapture();
+    WARN("Capture stopped; stopCapture took ",
+         std::chrono::duration<double, std::milli>(clock::now() - t0).count(), " ms");
+    sc6PlayCaptureSound("DXMT_SC6_CAPTURE_SOUND_DONE");
     break;
   }
   case CaptureState::NextAction::Nothing: {
@@ -233,5 +242,43 @@ void CommandQueue::Retain(uint64_t seq, Allocation* allocation) {
     tracker.addStorage(temp_buffer.ptr, block_size);
   }
 };
+
+
+// SC6 local frame log. Runs on the thread that calls Present, once per frame.
+// t_us is wall-clock time (to match the session logger's marks); dt_ms is the
+// time since the previous Present, measured with the monotonic clock.
+// present_wait_ms is how long Present blocked waiting for the GPU to finish an
+// older frame (the frame-latency limit), so a large value means the GPU is the limit.
+void
+CommandQueue::sc6LogFrame(uint64_t frame, const FrameStatistics *lagged) {
+  static FILE *f;
+  static bool checked;
+  static std::chrono::steady_clock::time_point last;
+  if (!checked) {
+    checked = true;
+    auto path = env::getEnvVar("DXMT_SC6_FRAME_LOG");
+    if (!path.empty() && (f = fopen(path.c_str(), "w")))
+      fprintf(f, "frame\tt_us\tdt_ms\tstats_frame\tpresent_wait_ms\tdrawable_wait_ms\tsync_ms\tsync_count\tcommit_ms"
+                 "\tencode_prep_ms\tencode_flush_ms\tcmdbufs\trender_passes\tcompute_passes\tblit_passes\tevent_stall\n");
+  }
+  if (!f)
+    return;
+  static const FrameStatistics empty{};
+  const FrameStatistics &s = lagged ? *lagged : empty;
+  long long stats_frame = lagged ? (long long)(frame - kSc6StatsLag) : -1;
+  auto now = std::chrono::steady_clock::now();
+  auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+  double dt = frame ? std::chrono::duration<double, std::milli>(now - last).count() : 0.0;
+  last = now;
+  long long wall = std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::system_clock::now().time_since_epoch()).count();
+  fprintf(f, "%llu\t%lld\t%.3f\t%lld\t%.3f\t%.3f\t%.3f\t%u\t%.3f\t%.3f\t%.3f\t%u\t%u\t%u\t%u\t%u\n",
+          (unsigned long long)frame, wall, dt, stats_frame, ms(s.present_latency_interval), ms(s.drawable_blocking_interval),
+          ms(s.sync_interval), s.sync_count, ms(s.commit_interval), ms(s.encode_prepare_interval),
+          ms(s.encode_flush_interval), s.command_buffer_count, s.render_pass_count, s.compute_pass_count,
+          s.blit_pass_count, s.event_stall);
+  if (frame % 60 == 0)
+    fflush(f);
+}
 
 } // namespace dxmt

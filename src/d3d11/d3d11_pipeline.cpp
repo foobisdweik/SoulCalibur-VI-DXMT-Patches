@@ -32,6 +32,9 @@ public:
       VertexShader =
           pDesc->VertexShader->get_shader(ShaderVariantVertexStreamOutput{
               pDesc->InputLayout, (uint64_t)pDesc->SOLayout});
+    } else if (pDesc->GSPassthrough == kGSLayered && pDesc->GeometryShader) {
+      VertexShader = pDesc->VertexShader->get_shader(ShaderVariantGeometryLayeredVertex{
+          pDesc->InputLayout, pDesc->GeometryShader});
     } else {
       VertexShader = pDesc->VertexShader->get_shader(ShaderVariantVertex{
           pDesc->InputLayout, pDesc->GSPassthrough, !pDesc->RasterizationEnabled});

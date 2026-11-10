@@ -88,6 +88,9 @@ struct MTL_GEOMETRY_SHADER_REFLECTION {
     uint32_t GSPassThrough;
   };
   uint32_t Primitive;
+  /* Number of render target array slices that a layered GS writes, or 0 if
+     the GS cannot run as a vertex shader with instancing. */
+  uint32_t LayeredFaces;
 };
 
 struct MTL_POST_TESSELLATOR_REFLECTION {
@@ -204,6 +207,8 @@ enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE {
   SM50_SHADER_PSO_TESSELLATOR = 7,
   SM50_SHADER_ROOT_SIGNATURE = 8,
   SM50_SHADER_ROOT_SIGNATURE2 = 9,
+  /* SM50CompileGeometryPipelineVertex: build the layered GS vertex function */
+  SM50_SHADER_GS_LAYERED = 10,
   SM50_SHADER_ARGUMENT_TYPE_MAX = 0xffffffff,
 };
 
@@ -291,6 +296,11 @@ struct SM50_SHADER_GS_PASS_THROUGH_DATA {
     uint32_t DataEncoded;
   };
   bool RasterizationDisabled;
+};
+
+struct SM50_SHADER_GS_LAYERED_DATA {
+  void *next;
+  enum SM50_SHADER_COMPILATION_ARGUMENT_TYPE type;
 };
 
 struct SM50_SHADER_PSO_GEOMETRY_SHADER_DATA {

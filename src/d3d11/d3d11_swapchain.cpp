@@ -383,7 +383,14 @@ public:
     DXGI_MODE_DESC1 preferred_mode = *pDisplayMode;
     DXGI_MODE_DESC1 selected_mode = {};
 
-    if (!(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH)) {
+    // SC6 fork: dxgi.keepDesktopMode=True treats every swap chain as if it
+    // lacked ALLOW_MODE_SWITCH. Fullscreen then keeps the desktop's display
+    // mode and only covers the screen with the window, so a back buffer
+    // smaller than the screen reaches MetalFX instead of making Wine switch
+    // the whole display to that size.
+    static const bool keep_desktop_mode =
+        Config::getInstance().getOption<bool>("dxgi.keepDesktopMode", false);
+    if (keep_desktop_mode || !(desc_.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH)) {
       preferred_mode.Width = 0;
       preferred_mode.Height = 0;
     }

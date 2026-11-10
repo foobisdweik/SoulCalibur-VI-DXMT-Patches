@@ -7,6 +7,10 @@
 #include "d3d11_state_object.hpp"
 #include "util_hash.hpp"
 
+/* MTL_GRAPHICS_PIPELINE_DESC::GSPassthrough value for an ordinary pipeline
+   whose vertex function also runs a layered geometry shader. */
+constexpr uint32_t kGSLayered = 0xFFFFFFFE;
+
 struct MTL_GRAPHICS_PIPELINE_DESC {
   ManagedShader VertexShader;
   ManagedShader HullShader;

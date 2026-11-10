@@ -154,6 +154,18 @@ struct ShaderVariantGeometryVertex {
   }
 };
 
+/* Vertex shader and a "layered" geometry shader merged into one vertex
+   function. See src/airconv/dxbc_converter_gs_layered.cpp. */
+struct ShaderVariantGeometryLayeredVertex {
+  using this_type = ShaderVariantGeometryLayeredVertex;
+  ManagedInputLayout input_layout_handle;
+  ManagedShader geometry_shader_handle;
+  bool operator==(const this_type &rhs) const {
+    return input_layout_handle == rhs.input_layout_handle &&
+           geometry_shader_handle == rhs.geometry_shader_handle;
+  }
+};
+
 struct ShaderVariantGeometry {
   using this_type = ShaderVariantGeometry;
   ManagedShader vertex_shader_handle;
@@ -183,7 +195,8 @@ using ShaderVariant =
     std::variant<ShaderVariantDefault, ShaderVariantVertex, ShaderVariantPixel,
                  ShaderVariantTessellationVertexHull,
                  ShaderVariantTessellationDomain, ShaderVariantVertexStreamOutput,
-                 ShaderVariantGeometryVertex, ShaderVariantGeometry>;
+                 ShaderVariantGeometryVertex, ShaderVariantGeometry,
+                 ShaderVariantGeometryLayeredVertex>;
 
 class ThreadpoolWork {
 public:
