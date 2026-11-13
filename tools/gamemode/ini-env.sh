@@ -16,13 +16,22 @@ sc6_ini_get() {  # section, key, default; an inline "; comment" is ignored
 sc6_ini_tf() { [[ $(sc6_ini_get launch "$1" "$2") == 1 ]] && print True || print False; }
 
 sc6_launch_env=(
-  "DXMT_CONFIG=dxgi.nativeFullscreen=$(sc6_ini_tf NativeFullscreen 1);dxgi.metalLayerPixelFormat=$([[ $(sc6_ini_get launch Bgr10a2Layer 1) == 1 ]] && print bgr10a2 || print auto);d3d11.metalSpatialUpscale=$(sc6_ini_tf MetalFXUpscale 0);d3d11.metalSpatialUpscaleFactor=$(sc6_ini_get launch MetalFXUpscaleFactor 2.0);d3d11.preferredMaxFrameRate=$(sc6_ini_get launch DxmtMaxFrameRate 0);d3d11.pipelineArchive=$(sc6_ini_tf PipelineArchive 0);dxgi.metalDisplaySync=$(sc6_ini_tf DisplaySync 0);"
+  "DXMT_CONFIG=dxgi.nativeFullscreen=$(sc6_ini_tf NativeFullscreen 1);dxgi.metalLayerPixelFormat=$([[ $(sc6_ini_get launch Bgr10a2Layer 1) == 1 ]] && print bgr10a2 || print auto);d3d11.metalSpatialUpscale=$(sc6_ini_tf MetalFXUpscale 0);d3d11.metalSpatialUpscaleFactor=$(sc6_ini_get launch MetalFXUpscaleFactor 2.0);d3d11.preferredMaxFrameRate=$(sc6_ini_get launch DxmtMaxFrameRate 0);d3d11.pipelineArchive=$(sc6_ini_tf PipelineArchive 0);dxgi.metalDisplaySync=$(sc6_ini_tf DisplaySync 0);dxgi.keepDesktopMode=$(sc6_ini_tf KeepDesktopMode 0);"
   "DXMT_METALFX_SPATIAL_SWAPCHAIN=0"  # MetalFXUpscale covers the same switch
   "DXMT_ENABLE_NVEXT=$(sc6_ini_get launch NvExt 0)"
   "DXMT_DUMP_LAYERS=${SC6_PRESENT_DIAGNOSTICS:-$(sc6_ini_get launch DumpLayers 1)}"
   "MTL_HUD_ENABLED=${SC6_METAL_HUD:-$(sc6_ini_get launch MetalHUD 1)}"
 )
-[[ $(sc6_ini_get launch DxmtLog 1) == 1 ]] || sc6_launch_env+=("DXMT_LOG_LEVEL=none" "DXMT_LOG_PATH=none")
+# DxmtLog=1 writes SoulcaliburVI_d3d11.log and the other DXMT logs into
+# DxmtLogDir (a Windows path; Z: is the Mac's root folder in these bottles).
+# Without a file path, DXMT sends its lines to Wine's debug output, which
+# CrossOver GUI launches do not keep.
+if [[ $(sc6_ini_get launch DxmtLog 1) == 1 ]]; then
+  sc6_launch_env+=("DXMT_LOG_LEVEL=$(sc6_ini_get launch DxmtLogLevel info)"
+                   "DXMT_LOG_PATH=$(sc6_ini_get launch DxmtLogDir "Z:$HOME/Library/Application Support/SC6-VRR/dxmt-logs")")
+else
+  sc6_launch_env+=("DXMT_LOG_LEVEL=none" "DXMT_LOG_PATH=none")
+fi
 [[ $(sc6_ini_get launch WineLog 1) == 1 ]] || sc6_launch_env+=("WINEDEBUG=-all")
 # Keys that the [launch] section owns, whether set or not, so callers can
 # remove stale copies (for example DXMT_LOG_LEVEL after DxmtLog=1).

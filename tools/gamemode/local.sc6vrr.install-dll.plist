@@ -11,11 +11,11 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/zsh</string>
-    <string>/Users/iphoobis/Projects/SC6-VRR/dll/sync-dll.sh</string>
+    <string>/Users/iphoobis/Developer/SC6-VRR/dll/sync-dll.sh</string>
   </array>
   <key>WatchPaths</key>
   <array>
-    <string>/Users/iphoobis/Projects/SC6-VRR/dll/build/dinput8.dll</string>
+    <string>/Users/iphoobis/Developer/SC6-VRR/dll/build/dinput8.dll</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

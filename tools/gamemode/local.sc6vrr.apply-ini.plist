@@ -7,7 +7,7 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/zsh</string>
-		<string>/Users/iphoobis/Projects/SC6-VRR/dll/apply-ini.sh</string>
+		<string>/Users/iphoobis/Developer/SC6-VRR/dll/apply-ini.sh</string>
 	</array>
 	<key>StandardErrorPath</key>
 	<string>/Users/iphoobis/Library/Logs/sc6vrr-apply-ini.log</string>
@@ -15,7 +15,7 @@
 	<string>/Users/iphoobis/Library/Logs/sc6vrr-apply-ini.log</string>
 	<key>WatchPaths</key>
 	<array>
-		<string>/Users/iphoobis/Library/Application Support/CrossOver/Bottles/SC6-Rosetta/drive_c/Games/SoulCalibur 6/SoulcaliburVI/Binaries/Win64/sc6vrr.ini</string>
+		<string>/Users/iphoobis/Library/Application Support/CrossOver/Bottles/SC6-FEX/drive_c/Games/SoulCalibur 6/SoulcaliburVI/Binaries/Win64/sc6vrr.ini</string>
 	</array>
 </dict>
 </plist>

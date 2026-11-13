@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Copy the [launch] section of sc6vrr.ini into cxbottle.conf of every bottle
-# whose C:\Games\SoulCalibur 6 is this game folder (SC6-Rosetta, and SC6-FEX
-# through its symlink), so CrossOver GUI launches use the same settings.
+# whose C:\Games\SoulCalibur 6 is this game folder (SC6-FEX, which holds the
+# game since 2026-11), so CrossOver GUI launches use the same settings.
 # It also makes each of those bottles load the sc6vrr dinput8.dll for
 # SoulcaliburVI.exe, because the DLL applies [sc6vrr].
 # dll/launch.sh runs this itself. Run it
@@ -12,7 +12,7 @@ set -euo pipefail
 here=${0:A:h}
 repo=${here:h}
 bottles_dir="$HOME/Library/Application Support/CrossOver/Bottles"
-win64=${SC6_WIN64:-$bottles_dir/SC6-Rosetta/drive_c/Games/SoulCalibur 6/SoulcaliburVI/Binaries/Win64}
+win64=${SC6_WIN64:-$bottles_dir/SC6-FEX/drive_c/Games/SoulCalibur 6/SoulcaliburVI/Binaries/Win64}
 wine=${CROSSOVER_APP:-/Applications/CrossOver Preview.app}/Contents/SharedSupport/CrossOver/bin/wine
 sc6_ini=${SC6_INI:-$win64/sc6vrr.ini}
 [[ -f $sc6_ini ]] || { print -u2 "Missing: $sc6_ini"; exit 1; }
@@ -42,10 +42,18 @@ key = lambda l: (re.match(r'\s*"([^"]+)"\s*=', l) or [None, None])[1]
 body = [l for l in lines[start + 1:end] if key(l) not in owned]
 while body and not body[-1].strip():
     body.pop()
+# Another tool's block that starts at the end of the section (for example
+# ";; lsfg-metal: begin", which closes after [Wine]) stays at the end, so our
+# keys never land inside it.
+opened = []
+while body and body[-1].startswith(";;") and body[-1].rstrip().endswith("begin"):
+    opened.insert(0, body.pop())
+while body and not body[-1].strip():
+    body.pop()
 for kv in wanted:
     k, v = kv.split("=", 1)
     body.append('"%s" = "%s"' % (k, v.replace("\\", "\\\\").replace('"', '\\"')))
-lines[start + 1:end] = body + [""]
+lines[start + 1:end] = body + opened + [""]
 open(path, "w").write("\n".join(lines))
 PY
   # The per-app override lives in the bottle registry. user.reg stores the

@@ -1,8 +1,8 @@
 #!/bin/zsh
 # Put the current sc6vrr build (dll/build/dinput8.dll) into the game folder,
 # so every way of starting the game loads it, including the CrossOver apps
-# such as "SoulcaliburVI (Game Mode) (SC6-FEX).app". Both bottles share that
-# folder (SC6-FEX links C:\Games\SoulCalibur 6 to the SC6-Rosetta copy).
+# such as "SoulcaliburVI (Game Mode) (SC6-FEX).app". The game folder is in the
+# SC6-FEX bottle.
 #
 # The LaunchAgent local.sc6vrr.install-dll runs this script when the build
 # changes and at login, so nobody needs to run it by hand. If the game is
@@ -11,7 +11,7 @@
 set -euo pipefail
 here=${0:A:h}
 build=$here/build/dinput8.dll
-win64=${SC6_WIN64:-$HOME/Library/Application Support/CrossOver/Bottles/SC6-Rosetta/drive_c/Games/SoulCalibur 6/SoulcaliburVI/Binaries/Win64}
+win64=${SC6_WIN64:-$HOME/Library/Application Support/CrossOver/Bottles/SC6-FEX/drive_c/Games/SoulCalibur 6/SoulcaliburVI/Binaries/Win64}
 target=$win64/dinput8.dll
 say() { print -r -- "$(date '+%F %T') $*"; }
 

@@ -16,10 +16,10 @@ set -euo pipefail
 zmodload zsh/datetime  # provides EPOCHREALTIME
 
 here=${0:A:h}
-game="$HOME/Library/Application Support/CrossOver/Bottles/SC6-Rosetta/drive_c/Games/SoulCalibur 6"
+game="$HOME/Library/Application Support/CrossOver/Bottles/SC6-FEX/drive_c/Games/SoulCalibur 6"
 bottle="$HOME/Library/Application Support/CrossOver/Bottles/SC6-FEX"
 cx="/Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver"
-dxmt_cache="$(getconf DARWIN_USER_CACHE_DIR)dxmt/SoulcaliburVI.exe"
+dxmt_cache="$(getconf DARWIN_USER_CACHE_DIR)mullion/SoulcaliburVI.exe"
 # Warm again only when less of the paks is resident than this (percent).
 min_resident=${SC6_WARM_MIN_RESIDENT:-60}
 
