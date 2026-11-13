@@ -66,6 +66,8 @@ static cl::opt<bool>
 // SC6 fork: SM50_SHADER_FLAG bits added to the compilation's flags, for example 0x10000 for
 // SM50_SHADER_FLAG_SKIP_CBUFFER_BOUNDS, to see what a path switch of d3d11.dll changes (airconv_switches.hpp)
 static cl::opt<unsigned> ExtraShaderFlags("shader-flags", cl::init(0), cl::desc("SM50_SHADER_FLAG bits to add"));
+// SC6 fork: the Metal version the output targets (SM50_SHADER_METAL_VERSION), 400 as d3d11.dll uses on the SC6 machine
+static cl::opt<unsigned> MetalVersion("metal-version", cl::init(400), cl::desc("Metal version: 320 or 400"));
 
 // SC6 fork
 static cl::opt<bool> GSLayered(
@@ -287,7 +289,7 @@ int main(int argc, char **argv) {
   }
 
   SM50_SHADER_COMMON_DATA data;
-  data.metal_version = SM50_SHADER_METAL_320;
+  data.metal_version = SM50_SHADER_METAL_VERSION(MetalVersion.getValue());
   data.flags = NoCustomBorder ? SM50_SHADER_FLAG_NO_CUSTOM_BORDER : SM50_SHADER_FLAG{};
   data.simd_width = 0; // no device to ask; a vertex shader's wave has no lane count here
   data.next = 0;

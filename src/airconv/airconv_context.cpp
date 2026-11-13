@@ -179,10 +179,13 @@ runOptimizationPasses(llvm::Module &M, llvm::raw_ostream &Error) {
     auto skip = getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP");
     if (!skip || !strstr(skip, "simdgroup-barrier"))
       GlobalCleanupPM.addPass(air::SimdgroupImplicitMemBarrierPass());
-    GlobalCleanupPM.addPass(air::GuardOutOfBoundsPass());
+    // SC6 fork: SM50_SHADER_FLAG_SKIP_BOUNDS_GUARD (or MULLION_AIRCONV_SKIP=bounds-guard) leaves the guard out
+    if (!airconv_skipped("bounds-guard", SM50_SHADER_FLAG_SKIP_BOUNDS_GUARD))
+      GlobalCleanupPM.addPass(air::GuardOutOfBoundsPass());
     // loads move ahead of what uses them, at most 32 registers of values ahead (MULLION_AIRCONV_HOIST_LOADS, which
     // the shader cache's key has, for another window): more, and Metal's compiler spills them
-    if (!skip || !strstr(skip, "hoist-loads")) {
+    // SC6 fork: SM50_SHADER_FLAG_SKIP_HOIST_LOADS leaves this out too
+    if (!airconv_skipped("hoist-loads", SM50_SHADER_FLAG_SKIP_HOIST_LOADS)) {
       auto window = getenv("MULLION_AIRCONV_HOIST_LOADS");
       GlobalCleanupPM.addPass(air::HoistLoadsPass(window ? atoi(window) : 32));
     }

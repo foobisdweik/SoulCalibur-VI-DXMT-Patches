@@ -19,6 +19,10 @@ static const std::array<Sc6PathInfo, size_t(Sc6Path::Count)> kPaths = {{
     {"pipeline-archive", "mullion.pipelineArchive", SM50_SHADER_FLAG{}},
     {"anisotropic-gradients", "mullion.anisoGradients", SM50_SHADER_FLAG_SKIP_ANISO_GRADIENTS},
     {"lazy-sampler-emulation", "mullion.lazySamplerEmulation", SM50_SHADER_FLAG{}},
+    {"hoist-loads", "mullion.hoistLoads", SM50_SHADER_FLAG_SKIP_HOIST_LOADS},
+    {"bounds-guard", "mullion.boundsGuard", SM50_SHADER_FLAG_SKIP_BOUNDS_GUARD},
+    {"cbuffer-dwords", "mullion.cbufferDwords", SM50_SHADER_FLAG_SKIP_CBUFFER_DWORDS},
+    {"unbound-drop", "mullion.unboundDrop", SM50_SHADER_FLAG_SKIP_UNBOUND_DROP},
 }};
 
 const Sc6PathInfo &

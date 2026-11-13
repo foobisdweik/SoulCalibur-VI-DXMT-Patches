@@ -109,6 +109,12 @@ Converter::LoadConstantBuffer(const ConstantBufferDescriptor &Buffer, llvm::Valu
   auto Load = [&](unsigned Dword) -> llvm::Value * {
     return ir.CreateLoad(air.getIntTy(), ir.CreateGEP(TyIntVec4, RowPointer, {ir.getInt32(0), ir.getInt32(Dword)}));
   };
+  // SC6 fork: SM50_SHADER_FLAG_SKIP_CBUFFER_DWORDS (MULLION_AIRCONV_SKIP=cbuffer-dwords) loads the whole row, as the
+  // old SC6 build did, and picks the dwords from it
+  if (airconv_skipped("cbuffer-dwords", SM50_SHADER_FLAG_SKIP_CBUFFER_DWORDS)) {
+    auto Vector = ir.CreateAlignedLoad(TyIntVec4, RowPointer, llvm::Align(16));
+    return Component >= 0 ? ir.CreateExtractElement(Vector, Component) : Vector;
+  }
   // a row's dwords load one by one, only those read: a vector load reads all four, and costs the shader more
   llvm::Value *Value = Component >= 0 ? Load(Component) : llvm::PoisonValue::get(TyIntVec4);
   for (unsigned i = 0; Component < 0 && i < 4; i++)

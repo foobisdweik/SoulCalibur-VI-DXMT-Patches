@@ -20,6 +20,7 @@
 #include "llvm/ADT/Optional.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/FMF.h"
+#include "../airconv_switches.hpp"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Value.h"
 
@@ -670,7 +671,10 @@ public:
           ir.CreateAnd(Descriptor.Metadata, SM50_TEXTURE_MULTISAMPLE_METADATA_PAIRED), ir.getInt64(0)
       );
     }
-    Texture.Unbound = ir.CreateICmpNE(ir.CreateAnd(Descriptor.Metadata, SM50_TEXTURE_METADATA_UNBOUND), ir.getInt64(0));
+    // SC6 fork: SM50_SHADER_FLAG_SKIP_UNBOUND_DROP (MULLION_AIRCONV_SKIP=unbound-drop) leaves Unbound null, so no texture
+    // call selects 0 for an unbound slot (AIRBuilder::CreateTextureCall)
+    if (!mullion::airconv_skipped("unbound-drop", SM50_SHADER_FLAG_SKIP_UNBOUND_DROP))
+      Texture.Unbound = ir.CreateICmpNE(ir.CreateAnd(Descriptor.Metadata, SM50_TEXTURE_METADATA_UNBOUND), ir.getInt64(0));
     return {
         Texture,
         Descriptor.ResourceKindLogical,

@@ -30,6 +30,14 @@ enum class Sc6Path : unsigned {
   AnisoGradients,
   /* shaders leave out the minimum and maximum filter emulation until a sampler needs it (SamplerEmulationsLeftOut) */
   LazySamplerEmulation,
+  /* loads move to the start of the shader, ahead of what uses them (HoistLoadsPass) */
+  HoistLoads,
+  /* each buffer access that can fall outside its view runs inside a branch (GuardOutOfBoundsPass) */
+  BoundsGuard,
+  /* a constant buffer read loads each dword it uses on its own, in place of the whole 16-byte row */
+  CbufferDwords,
+  /* every texture call drops what an unbound texture's stand-in answers, so an unbound slot reads 0 (D3D11.3 22.4.22) */
+  UnboundDrop,
   Count,
 };
 

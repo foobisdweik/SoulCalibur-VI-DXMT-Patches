@@ -559,6 +559,16 @@ enum SM50_SHADER_FLAG {
   SM50_SHADER_FLAG_SKIP_SAMPLE_BRANCH_MERGE = 1 << 18,
   SM50_SHADER_FLAG_SKIP_MINMAX_BRANCH_MERGE = 1 << 19,
   SM50_SHADER_FLAG_SKIP_ANISO_GRADIENTS = 1 << 20,
+  /* loads stay where the shader uses them (no HoistLoadsPass), as in the old SC6 build */
+  SM50_SHADER_FLAG_SKIP_HOIST_LOADS = 1 << 21,
+  /* a buffer access outside its view is not wrapped in a branch (no GuardOutOfBoundsPass), as in the old SC6 build:
+     it goes through the null pointer that the bounds check selects */
+  SM50_SHADER_FLAG_SKIP_BOUNDS_GUARD = 1 << 22,
+  /* a constant buffer row loads as one 16-byte vector, as in the old SC6 build, in place of one load per dword read */
+  SM50_SHADER_FLAG_SKIP_CBUFFER_DWORDS = 1 << 23,
+  /* a texture call keeps what an unbound texture's stand-in answers: no select on SM50_TEXTURE_METADATA_UNBOUND drops
+     it to 0. the stand-in's contents are undefined, so a shader that reads an unbound slot may read garbage */
+  SM50_SHADER_FLAG_SKIP_UNBOUND_DROP = 1 << 24,
 };
 
 struct SM50_SHADER_COMMON_DATA {
