@@ -29,14 +29,17 @@ instead of shader objects, and descriptions instead of state objects. A
 later launch rebuilds MTL_GRAPHICS_PIPELINE_DESC from it once the game has
 created the same shaders again.
 
-Only pipelines without stream output are recorded, and only ordinary
-graphics pipelines (no geometry or tessellation emulation) and compute
-pipelines.
+Only pipelines without stream output are recorded: graphics pipelines,
+geometry shader pipelines (emulated with Metal mesh shaders), and compute
+pipelines. Tessellation pipelines are not recorded.
  */
 struct PipelineRecord {
   enum Kind : uint8_t {
     Graphics = 1,
     Compute = 2,
+    /* SC6 fork: a graphics pipeline with a geometry shader, built by GetGeometryPipeline (Metal mesh shaders). It
+       has the same fields as Graphics. */
+    Geometry = 3,
   };
   enum Slot : uint8_t {
     SlotVertex = 0,
@@ -93,10 +96,14 @@ pipelines a game compiled, both stored next to Mullion's shader cache.
 - Every pipeline compile looks up the archive first. On a hit, Metal loads
   the GPU binary instead of compiling it. On a miss, the pipeline is
   compiled normally, and then added to the archive off the critical path.
-- Every newly compiled pipeline description is recorded. At the next launch,
-  a recorded pipeline is queued for compilation (warm-up) as soon as the
-  game has created all of its shaders, so it is often ready before the
-  first draw that uses it.
+- Every newly compiled pipeline description is recorded, together with the
+  DXBC bytecode of its shaders (pso_shaders_<version>.bin). At the next
+  launch, the pipeline cache creates the stored shaders itself and queues
+  every recorded pipeline for compilation (warm-up), so most pipelines are
+  ready before the game's first draw with them. A record whose shaders are
+  not stored waits until the game has created all of them.
+- The list stays valid when the shader converter changes, because a record
+  describes Direct3D state and shader hashes, not converted code.
 - A background thread writes both files when no pipeline was added for a
   few seconds, and once more at device teardown. Nothing is written on the
   present path.
@@ -137,13 +144,34 @@ public:
   void OnWarmUpQueued() { warm_queued_.fetch_add(1, std::memory_order_relaxed); }
   void OnWarmUpFinished(bool success);
 
+  /**
+  SC6 fork: keep the DXBC bytecode of a shader the game created, so that the
+  shader file can store it if a recorded pipeline uses it.
+   */
+  void NoteShaderCode(const Sha1Digest &shader, const void *code, size_t length);
+
+  /**
+  SC6 fork: the stored shaders (hash and DXBC bytecode) that a recorded
+  pipeline still waits for. The pipeline cache creates them at start.
+   */
+  std::vector<std::pair<Sha1Digest, std::vector<uint8_t>>> StoredShadersForWarmUp();
+
+  /**
+  SC6 fork: the encode thread waited `ns` nanoseconds for a pipeline that was
+  not compiled yet. Counted for every device, logged with the archive stats.
+   */
+  static void NoteEncodeWait(uint64_t ns);
+
+  void LogStats(const char *when);
+
 private:
-  PipelineArchive(WMT::Device device, std::string archive_path, std::string list_path);
+  PipelineArchive(WMT::Device device, std::string archive_path, std::string list_path, std::string shaders_path);
 
   void LoadArchive();
   void LoadList();
+  void LoadShaders();
+  void SaveShaders();
   void SaveIfDirty();
-  void LogStats(const char *when);
   void SaverThread();
   void MarkChanged();
 
@@ -152,6 +180,7 @@ private:
   WMT::Reference<WMT::Device> device_;
   std::string archive_path_;
   std::string list_path_;
+  std::string shaders_path_;
 
   /* Shared by pipeline compiles that read or add to the archive, exclusive
      while the archive is serialized. */
@@ -165,6 +194,14 @@ private:
   mullion::mutex records_mutex_;
   std::unordered_set<Sha1Digest> known_records_;
   std::vector<std::vector<uint8_t>> record_blobs_;
+
+  /* SC6 fork: DXBC bytecode by shader hash, for every shader the game created and every stored shader; the shader
+     file keeps the ones that recorded pipelines use */
+  mullion::mutex shader_code_mutex_;
+  std::unordered_map<Sha1Digest, std::vector<uint8_t>> shader_code_;
+  std::unordered_set<Sha1Digest> recorded_shaders_; /* guarded by shader_code_mutex_ */
+  std::atomic<bool> shaders_dirty_ = false;
+  uint64_t loaded_shaders_ = 0;
 
   mullion::mutex warm_mutex_;
   std::vector<PipelineRecord> warm_records_;

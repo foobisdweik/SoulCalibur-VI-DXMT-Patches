@@ -110,7 +110,7 @@ public:
       device_->CreateTessellationMeshPipeline(&desc, &pipeline);
       return pipeline->GetPipeline(pPipeline);
     }
-    ready_.wait(false, std::memory_order_acquire);
+    WaitUntilPipelineReady(ready_);
     *pPipeline = {state_rasterization_, hull_reflection.NumOutputElement,
                   hull_reflection.ThreadsPerPatch, parts};
   }

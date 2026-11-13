@@ -6,8 +6,20 @@
 #include "d3d11_shader.hpp"
 #include "log/log.hpp"
 #include <atomic>
+#include <chrono>
 
 namespace mullion {
+
+void
+WaitUntilPipelineReady(std::atomic_bool &ready) {
+  if (ready.load(std::memory_order_acquire))
+    return;
+  auto start = std::chrono::steady_clock::now();
+  ready.wait(false, std::memory_order_acquire);
+  PipelineArchive::NoteEncodeWait(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()
+  );
+}
 
 class MTLCompiledGraphicsPipelineImpl
     : public MTLCompiledGraphicsPipeline {
@@ -57,7 +69,7 @@ public:
       device_->CreateGraphicsPipeline(&desc, &pipeline);
       return pipeline->GetPipeline(pPipeline);
     }
-    ready_.wait(false, std::memory_order_acquire);
+    WaitUntilPipelineReady(ready_);
     *pPipeline = {state_};
   }
 
@@ -187,7 +199,7 @@ public:
   }
 
   void GetPipeline(MTL_COMPILED_COMPUTE_PIPELINE *pPipeline) final {
-    ready_.wait(false, std::memory_order_acquire);
+    WaitUntilPipelineReady(ready_);
     *pPipeline = {state_};
   }
 

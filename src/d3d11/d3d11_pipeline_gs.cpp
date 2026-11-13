@@ -21,6 +21,7 @@
 #include "DXBCParser/d3d12tokenizedprogramformat.hpp"
 #include "d3d11_device.hpp"
 #include "d3d11_pipeline.hpp"
+#include "d3d11_pipeline_archive.hpp"
 #include "log/log.hpp"
 
 namespace mullion {
@@ -29,8 +30,9 @@ class MTLCompiledGeometryPipelineImpl
     : public MTLCompiledGeometryPipeline {
 public:
   MTLCompiledGeometryPipelineImpl(MTLD3D11Device *pDevice,
-                              const MTL_GRAPHICS_PIPELINE_DESC *pDesc)
-      : num_rtvs(pDesc->NumColorAttachments),
+                              const MTL_GRAPHICS_PIPELINE_DESC *pDesc,
+                              PipelineArchive *pArchive, bool WarmUp)
+      : archive_(pArchive), warm_up_(WarmUp), num_rtvs(pDesc->NumColorAttachments),
         depth_stencil_format(pDesc->DepthStencilFormat), device_(pDevice),
         pBlendState(pDesc->BlendState),
         RasterizationEnabled(pDesc->RasterizationEnabled),
@@ -91,11 +93,20 @@ public:
       device_->CreateGeometryPipeline(&desc, &pipeline);
       return pipeline->GetPipeline(pPipeline);
     }
-    ready_.wait(false, std::memory_order_acquire);
+    WaitUntilPipelineReady(ready_);
     *pPipeline = {state_mesh_[0], state_mesh_[1], GeometryInstances, MeshInstances};
   }
 
   ThreadpoolWork *RunThreadpoolWork() {
+    auto result = Build();
+    // SC6 fork: a warm-up pipeline (from a PipelineArchive record) reports its end once, when it is finished, not
+    // when it returns a shader it waits for
+    if (warm_up_ && archive_ && result == this)
+      archive_->OnWarmUpFinished(state_mesh_[0] != nullptr);
+    return result;
+  }
+
+  ThreadpoolWork *Build() {
 
     WMT::Reference<WMT::Error> err;
     MTL_COMPILED_SHADER vs[2] = {}, gs[2] = {}, ps;
@@ -191,6 +202,8 @@ public:
   }
 
 private:
+  PipelineArchive *archive_;
+  bool warm_up_;
   UINT num_rtvs;
   UINT ps_valid_render_targets;
   WMTPixelFormat rtv_formats[8];
@@ -212,8 +225,9 @@ private:
 
 std::unique_ptr<MTLCompiledGeometryPipeline>
 CreateGeometryPipeline(MTLD3D11Device *pDevice,
-                       MTL_GRAPHICS_PIPELINE_DESC *pDesc) {
-  return std::make_unique<MTLCompiledGeometryPipelineImpl>(pDevice, pDesc);
+                       MTL_GRAPHICS_PIPELINE_DESC *pDesc,
+                       PipelineArchive *pArchive, bool WarmUp) {
+  return std::make_unique<MTLCompiledGeometryPipelineImpl>(pDevice, pDesc, pArchive, WarmUp);
 }
 
 } // namespace mullion

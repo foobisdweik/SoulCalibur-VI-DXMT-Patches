@@ -220,7 +220,12 @@ CreateComputePipeline(MTLD3D11Device *pDevice, ManagedShader ComputeShader,
                       PipelineArchive *pArchive = nullptr, bool WarmUp = false);
 
 std::unique_ptr<MTLCompiledGeometryPipeline>
-CreateGeometryPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDesc);
+CreateGeometryPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDesc,
+                       PipelineArchive *pArchive = nullptr, bool WarmUp = false);
+
+// SC6 fork: wait until a pipeline is compiled. A wait that blocks (the pipeline was not ready) is timed and counted
+// for the archive log (PipelineArchive::NoteEncodeWait), because each one stalls the encode thread.
+void WaitUntilPipelineReady(std::atomic_bool &ready);
 
 std::unique_ptr<MTLCompiledTessellationMeshPipeline>
 CreateTessellationMeshPipeline(MTLD3D11Device *pDevice, MTL_GRAPHICS_PIPELINE_DESC *pDesc);

@@ -19,12 +19,23 @@ constexpr char kListMagic[8] = {'D', 'X', 'M', 'T', 'P', 'S', 'O', 'L'};
 /* Bump when PipelineRecord or the meaning of a stored field changes. 2: Mullion's extra pipeline key fields. */
 constexpr uint32_t kListFormatVersion = 2;
 constexpr uint32_t kMaxRecords = 16384;
+/* Shader file (SC6 fork): header, then shaders. Each shader is stored as the SHA-1 of its DXBC bytecode (the hash
+   Mullion keys shaders by), the length, and the bytecode. A shader whose bytes do not match the hash is skipped. */
+constexpr char kShadersMagic[8] = {'D', 'X', 'M', 'T', 'P', 'S', 'O', 'S'};
+constexpr uint32_t kShadersFormatVersion = 1;
+constexpr uint32_t kMaxShaderLength = 4u << 20;
+constexpr uint64_t kMaxShadersFile = 512ull << 20;
 /* Write the files only after this long without a newly added pipeline, so
    that serialization does not compete with a burst of compiles. */
 constexpr auto kSaveIdleTime = std::chrono::seconds(5);
 constexpr auto kSaverWakeInterval = std::chrono::seconds(2);
 
 std::atomic<bool> g_archive_owned = false;
+
+/* SC6 fork: encode-thread waits for pipelines that were not compiled yet (PipelineArchive::NoteEncodeWait) */
+std::atomic<uint64_t> g_encode_waits = 0;
+std::atomic<uint64_t> g_encode_wait_ns = 0;
+std::atomic<uint64_t> g_encode_wait_max_ns = 0;
 
 class ByteWriter {
 public:
@@ -127,7 +138,7 @@ PipelineRecord::Serialize(std::vector<uint8_t> &out) const {
     if (shader_mask & (1 << i))
       w.bytes(shaders[i].data, sizeof(shaders[i].data));
   }
-  if (kind != Graphics)
+  if (kind == Compute)
     return;
   w.u32(num_color_attachments);
   for (unsigned i = 0; i < 8; i++)
@@ -181,7 +192,7 @@ PipelineRecord::Deserialize(const uint8_t *data, size_t size) {
   uint8_t kind_;
   if (!r.u8(kind_) || !r.u8(shader_mask))
     return false;
-  if (kind_ != Graphics && kind_ != Compute)
+  if (kind_ != Graphics && kind_ != Compute && kind_ != Geometry)
     return false;
   kind = Kind(kind_);
   if (shader_mask >> NumSlots)
@@ -282,19 +293,24 @@ PipelineArchive::Create(WMT::Device device, WMTMetalVersion metal_version) {
   }
   return std::unique_ptr<PipelineArchive>(new PipelineArchive(
       device, dir + str::format("pso_archive_", (unsigned int)metal_version, ".bin"),
-      dir + str::format("pso_list_", (unsigned int)metal_version, ".bin")
+      dir + str::format("pso_list_", (unsigned int)metal_version, ".bin"),
+      dir + str::format("pso_shaders_", (unsigned int)metal_version, ".bin")
   ));
 }
 
-PipelineArchive::PipelineArchive(WMT::Device device, std::string archive_path, std::string list_path) :
+PipelineArchive::PipelineArchive(
+    WMT::Device device, std::string archive_path, std::string list_path, std::string shaders_path
+) :
     device_(device),
     archive_path_(std::move(archive_path)),
-    list_path_(std::move(list_path)) {
+    list_path_(std::move(list_path)),
+    shaders_path_(std::move(shaders_path)) {
   LoadArchive();
   LoadList();
+  LoadShaders();
   WARN(
-      "PipelineArchive: loaded ", archive_loaded_ ? "an existing" : "an empty", " archive and ", loaded_records_,
-      " recorded pipelines for warm-up"
+      "PipelineArchive: loaded ", archive_loaded_ ? "an existing" : "an empty", " archive, ", loaded_records_,
+      " recorded pipelines for warm-up, and ", loaded_shaders_, " stored shaders"
   );
   saver_ = mullion::thread([this]() { SaverThread(); });
 }
@@ -361,11 +377,16 @@ PipelineArchive::LoadList() {
   r.u32(airconv_version);
   r.u32(metal_version);
   r.u32(count);
-  if (memcmp(magic, kListMagic, sizeof(magic)) || format != kListFormatVersion ||
-      airconv_version != (uint32_t)kMullionShaderCacheVersion) {
-    WARN("PipelineArchive: ignoring ", list_path_, ", because it was written by another version");
+  /* SC6 fork: a record holds Direct3D state and shader hashes, which a new converter version does not change, so a
+     list from another converter version stays valid (only a new record format makes it unreadable) */
+  if (memcmp(magic, kListMagic, sizeof(magic)) || format != kListFormatVersion) {
+    WARN("PipelineArchive: ignoring ", list_path_, ", because it was written in another format");
     return;
   }
+  if (airconv_version != (uint32_t)kMullionShaderCacheVersion)
+    Logger::info(str::format(
+        "PipelineArchive: keeping the records of ", list_path_, ", written with converter version ", airconv_version
+    ));
 
   uint32_t skipped = 0;
   for (uint32_t i = 0; i < count && i < kMaxRecords; i++) {
@@ -390,6 +411,7 @@ PipelineArchive::LoadList() {
     for (unsigned slot = 0; slot < PipelineRecord::NumSlots; slot++) {
       if (!(record.shader_mask & (1 << slot)))
         continue;
+      recorded_shaders_.insert(record.shaders[slot]);
       /* a shader in two slots counts once */
       auto &waiting = warm_waiting_[record.shaders[slot]];
       if (waiting.empty() || waiting.back() != index) {
@@ -528,8 +550,122 @@ PipelineArchive::Record(const PipelineRecord &record) {
       return;
     record_blobs_.push_back(std::move(blob));
   }
+  {
+    std::lock_guard<mullion::mutex> lock(shader_code_mutex_);
+    for (unsigned slot = 0; slot < PipelineRecord::NumSlots; slot++) {
+      if ((record.shader_mask & (1 << slot)) && recorded_shaders_.insert(record.shaders[slot]).second &&
+          shader_code_.count(record.shaders[slot]))
+        shaders_dirty_.store(true);
+    }
+  }
   list_dirty_.store(true);
   MarkChanged();
+}
+
+void
+PipelineArchive::NoteShaderCode(const Sha1Digest &shader, const void *code, size_t length) {
+  if (length > kMaxShaderLength)
+    return;
+  std::lock_guard<mullion::mutex> lock(shader_code_mutex_);
+  auto [iter, inserted] = shader_code_.try_emplace(shader);
+  if (!inserted)
+    return;
+  iter->second.assign((const uint8_t *)code, (const uint8_t *)code + length);
+  /* a record loaded from the list can name a shader that the shader file does not have yet */
+  if (recorded_shaders_.count(shader)) {
+    shaders_dirty_.store(true);
+    MarkChanged();
+  }
+}
+
+std::vector<std::pair<Sha1Digest, std::vector<uint8_t>>>
+PipelineArchive::StoredShadersForWarmUp() {
+  std::unordered_set<Sha1Digest> waiting;
+  {
+    std::lock_guard<mullion::mutex> lock(warm_mutex_);
+    for (auto &[shader, records] : warm_waiting_)
+      waiting.insert(shader);
+  }
+  std::vector<std::pair<Sha1Digest, std::vector<uint8_t>>> result;
+  std::lock_guard<mullion::mutex> lock(shader_code_mutex_);
+  for (auto &shader : waiting) {
+    if (auto iter = shader_code_.find(shader); iter != shader_code_.end())
+      result.emplace_back(shader, iter->second);
+  }
+  return result;
+}
+
+void
+PipelineArchive::NoteEncodeWait(uint64_t ns) {
+  g_encode_waits.fetch_add(1, std::memory_order_relaxed);
+  g_encode_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+  uint64_t max = g_encode_wait_max_ns.load(std::memory_order_relaxed);
+  while (ns > max && !g_encode_wait_max_ns.compare_exchange_weak(max, ns, std::memory_order_relaxed)) {
+  }
+}
+
+void
+PipelineArchive::LoadShaders() {
+  uint64_t size = 0;
+  if (!WMTReadCacheFile(shaders_path_.c_str(), nullptr, 0, &size) || size < 16 || size > kMaxShadersFile)
+    return;
+  std::vector<uint8_t> data(size);
+  uint64_t read_size = 0;
+  if (!WMTReadCacheFile(shaders_path_.c_str(), data.data(), data.size(), &read_size) || read_size != size)
+    return;
+  ByteReader r(data.data(), data.size());
+  char magic[8];
+  uint32_t format, count;
+  if (!r.bytes(magic, sizeof(magic)) || !r.u32(format) || !r.u32(count) ||
+      memcmp(magic, kShadersMagic, sizeof(magic)) || format != kShadersFormatVersion) {
+    WARN("PipelineArchive: ignoring ", shaders_path_, ", because it was written in another format");
+    return;
+  }
+  uint32_t skipped = 0;
+  std::lock_guard<mullion::mutex> lock(shader_code_mutex_);
+  for (uint32_t i = 0; i < count; i++) {
+    Sha1Digest digest;
+    uint32_t length;
+    if (!r.bytes(digest.data, sizeof(digest.data)) || !r.u32(length) || length > kMaxShaderLength)
+      break;
+    std::vector<uint8_t> code(length);
+    if (!r.bytes(code.data(), length))
+      break;
+    if (Sha1HashState::compute(code.data(), code.size()) != digest) {
+      skipped++;
+      continue;
+    }
+    shader_code_.try_emplace(digest, std::move(code));
+  }
+  loaded_shaders_ = shader_code_.size();
+  if (skipped)
+    WARN("PipelineArchive: skipped ", skipped, " damaged shaders in ", shaders_path_);
+}
+
+void
+PipelineArchive::SaveShaders() {
+  std::vector<uint8_t> data;
+  ByteWriter w(data);
+  w.bytes(kShadersMagic, sizeof(kShadersMagic));
+  w.u32(kShadersFormatVersion);
+  w.u32(0); /* the count, set below */
+  uint32_t count = 0;
+  {
+    std::lock_guard<mullion::mutex> lock(shader_code_mutex_);
+    for (auto &shader : recorded_shaders_) {
+      auto iter = shader_code_.find(shader);
+      if (iter == shader_code_.end())
+        continue;
+      w.bytes(shader.data, sizeof(shader.data));
+      w.u32(iter->second.size());
+      w.bytes(iter->second.data(), iter->second.size());
+      count++;
+    }
+  }
+  memcpy(data.data() + sizeof(kShadersMagic) + sizeof(uint32_t), &count, sizeof(count));
+  if (!WMTWriteCacheFile(shaders_path_.c_str(), data.data(), data.size())) {
+    WARN("PipelineArchive: cannot write ", shaders_path_);
+  }
 }
 
 void
@@ -592,6 +728,8 @@ PipelineArchive::SaveIfDirty() {
       WARN("PipelineArchive: cannot write ", list_path_);
     }
   }
+  if (shaders_dirty_.exchange(false))
+    SaveShaders();
 }
 
 void
@@ -604,7 +742,8 @@ PipelineArchive::LogStats(const char *when) {
   WARN(
       "PipelineArchive ", when, ": archive hits=", hits_.load(), " misses=", misses_.load(),
       " added=", added_.load(), "; warm-up queued=", warm_queued_.load(), " finished=", warm_finished_.load(),
-      " failed=", warm_failed_.load(), "; recorded pipelines=", records
+      " failed=", warm_failed_.load(), "; recorded pipelines=", records, "; encode waits=", g_encode_waits.load(),
+      " total=", g_encode_wait_ns.load() / 1000000, " ms max=", g_encode_wait_max_ns.load() / 1000000, " ms"
   );
 }
 
@@ -621,10 +760,10 @@ PipelineArchive::SaverThread() {
     }
     auto now = clock::now();
     auto last_change = clock::time_point(clock::duration(last_change_.load(std::memory_order_relaxed)));
-    if ((archive_dirty_.load() || list_dirty_.load()) && now - last_change >= kSaveIdleTime) {
+    if ((archive_dirty_.load() || list_dirty_.load() || shaders_dirty_.load()) && now - last_change >= kSaveIdleTime) {
       SaveIfDirty();
     }
-    uint64_t sum = hits_.load() + misses_.load() + warm_finished_.load() + warm_queued_.load();
+    uint64_t sum = hits_.load() + misses_.load() + warm_finished_.load() + warm_queued_.load() + g_encode_waits.load();
     if (sum != logged_stats_sum_ && now - last_log >= std::chrono::seconds(10)) {
       logged_stats_sum_ = sum;
       last_log = now;

@@ -10,12 +10,16 @@
 #include "DXBCParser/d3d12tokenizedprogramformat.hpp"
 #include "mullion_tasks.hpp"
 #include "log/log.hpp"
+#include "config/config.hpp"
+#include "util_env.hpp"
 #include "sha1/sha1_util.hpp"
 #include "util_md5.hpp"
 #include "../d3d10/d3d10_shader.hpp"
 #include <optional>
 #include "../d3d10/d3d10_input_layout.hpp"
+#include <chrono>
 #include <cstring>
+#include <mutex>
 #include <shared_mutex>
 #include <unordered_set>
 
@@ -219,6 +223,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
   mullion::mutex mutex_;
 
   std::unordered_map<MTL_GRAPHICS_PIPELINE_DESC, std::unique_ptr<MTLCompiledGeometryPipeline>> pipelines_gs_;
+  std::unordered_set<ThreadpoolWork *> warm_pending_gs_;
   mullion::mutex mutex_gs_;
 
   std::unordered_map<MTL_GRAPHICS_PIPELINE_DESC, std::unique_ptr<MTLCompiledTessellationMeshPipeline>> pipelines_ts_;
@@ -234,8 +239,42 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   task_scheduler<ThreadpoolWork *> scheduler_;
 
+  // SC6 fork: the thread that creates the archive's stored shaders at start (eager warm-up). Declared after
+  // scheduler_ and joined in ~PipelineCache(), so it stops before the workers and the archive go away.
+  std::once_flag eager_once_;
+  std::atomic<bool> eager_stop_ = false;
+  mullion::thread eager_;
+
+  /**
+  SC6 fork: create every stored shader that a recorded pipeline waits for, on a thread of its own. Each created
+  shader queues the recorded pipelines that now have all their shaders (WarmUpPipelines), so most of the game's
+  pipelines compile at start instead of at the first draw. The game's own CreateVertexShader (and the others) later
+  find these shaders by hash. Runs once, at the first shader or pipeline request, when the device is complete.
+   */
+  void StartEagerWarmUp() {
+    if (!archive_ || !Config::getInstance().getOption<bool>("d3d11.pipelineEagerWarmUp", true))
+      return;
+    eager_ = mullion::thread([this]() {
+      env::setThreadName("mullion-pso-prewarm");
+      auto start = std::chrono::steady_clock::now();
+      auto shaders = archive_->StoredShadersForWarmUp();
+      unsigned created = 0;
+      for (auto &[sha1, code] : shaders) {
+        if (eager_stop_.load(std::memory_order_relaxed))
+          break;
+        if (!FindShader(sha1) && CreateShader(code.data(), code.size()))
+          created++;
+      }
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+      WARN("PipelineArchive: created ", created, " of ", shaders.size(), " stored shaders for warm-up in ", ms.count(),
+           " ms");
+      archive_->LogStats("after creating the stored shaders");
+    });
+  }
+
   CachedSM50Shader *CreateShader(const void *pBytecode,
                                  uint32_t BytecodeLength) {
+    std::call_once(eager_once_, [this]() { StartEagerWarmUp(); });
     auto sha1 = Sha1HashState::compute(pBytecode, BytecodeLength);
     {
       std::shared_lock<std::shared_mutex> lock(mutex_shares);
@@ -267,8 +306,10 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 #endif
       created = shaders_.emplace(sha1, std::move(shader)).first->second.get();
     }
-    if (archive_)
+    if (archive_) {
+      archive_->NoteShaderCode(sha1, pBytecode, BytecodeLength);
       WarmUpPipelines(sha1);
+    }
     return created;
   }
 
@@ -347,6 +388,12 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
       desc.QuadLines = record.quad_lines;
       desc.PipelineStatistics = record.pipeline_statistics;
 
+      if (record.kind == PipelineRecord::Geometry) {
+        MTLCompiledGeometryPipeline *pipeline;
+        if (GetGeometryPipelineImpl(&desc, &pipeline, true))
+          archive_->OnWarmUpQueued();
+        continue;
+      }
       MTLCompiledGraphicsPipeline *pipeline;
       if (GetGraphicsPipelineImpl(&desc, &pipeline, true))
         archive_->OnWarmUpQueued();
@@ -554,6 +601,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   void GetGraphicsPipeline(MTL_GRAPHICS_PIPELINE_DESC *pDesc,
                            MTLCompiledGraphicsPipeline **ppPipeline) override {
+    std::call_once(eager_once_, [this]() { StartEagerWarmUp(); });
     if (GetGraphicsPipelineImpl(pDesc, ppPipeline, false) && archive_) {
       PipelineRecord record;
       if (PipelineRecord::FromGraphicsDesc(*pDesc, record))
@@ -595,20 +643,43 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
   void GetGeometryPipeline(
       MTL_GRAPHICS_PIPELINE_DESC *pDesc,
       MTLCompiledGeometryPipeline **ppPipeline) override {
+    // SC6 fork: geometry shader pipelines are recorded and warmed up like graphics pipelines
+    if (GetGeometryPipelineImpl(pDesc, ppPipeline, false) && archive_) {
+      PipelineRecord record;
+      if (PipelineRecord::FromGraphicsDesc(*pDesc, record)) {
+        record.kind = PipelineRecord::Geometry;
+        archive_->Record(record);
+      }
+    }
+  }
+
+  // true if a new pipeline was created and queued
+  bool GetGeometryPipelineImpl(MTL_GRAPHICS_PIPELINE_DESC *pDesc, MTLCompiledGeometryPipeline **ppPipeline,
+                               bool WarmUp) {
     std::lock_guard<mullion::mutex> lock(mutex_gs_);
 
     if (auto iter = pipelines_gs_.find(*pDesc); iter != pipelines_gs_.end()) {
       *ppPipeline = iter->second.get();
-      return;
+      if (!WarmUp && !warm_pending_gs_.empty() && warm_pending_gs_.erase(iter->second.get()) &&
+          !iter->second->GetIsDone())
+        scheduler_.promote(iter->second.get());
+      return false;
     }
-    auto [iter, inserted] = pipelines_gs_.insert({*pDesc, CreateGeometryPipeline(device, pDesc)});
+    auto [iter, inserted] =
+        pipelines_gs_.insert({*pDesc, CreateGeometryPipeline(device, pDesc, archive_.get(), WarmUp)});
     if (!inserted) {
       D3D11_ASSERT(0 && "duplicated geometry pipeline");
     } else {
       iter->second->description = &iter->first;
-      scheduler_.submit(iter->second.get());
+      if (WarmUp) {
+        warm_pending_gs_.insert(iter->second.get());
+        scheduler_.submit_low(iter->second.get());
+      } else {
+        scheduler_.submit(iter->second.get());
+      }
     }
     *ppPipeline = iter->second.get();
+    return inserted;
   }
 
   void GetTessellationPipeline(MTL_GRAPHICS_PIPELINE_DESC * pDesc,
@@ -672,7 +743,22 @@ public:
       device(pDevice),
       archive_(PipelineArchive::Create(pDevice->GetMTLDevice(), pDevice->GetMullionDevice().metalVersion())),
       blend_states(pDevice),
-      so_layouts(pDevice) {};
+      so_layouts(pDevice) {
+    // SC6 fork: warm-up compiles may use all but 2 cores (d3d11.pipelineWarmUpThreads; 0 = that default). They
+    // run only while no compile that the game waits for is queued.
+    if (archive_) {
+      int n = Config::getInstance().getOption<int>("d3d11.pipelineWarmUpThreads", 0);
+      if (n <= 0)
+        n = std::max<int>(1, (int)mullion::thread::hardware_concurrency() - 2);
+      scheduler_.set_max_low_running(n);
+    }
+  }
+
+  ~PipelineCache() {
+    eager_stop_.store(true);
+    if (eager_.joinable())
+      eager_.join();
+  }
 };
 
 std::unique_ptr<MTLD3D11PipelineCacheBase>

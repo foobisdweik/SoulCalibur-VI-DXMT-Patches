@@ -33,6 +33,12 @@ public:
    */
   bool promote(Task task);
 
+  /**
+  SC6 fork: the number of low-priority tasks that may run at the same time. Workers are added as needed, up to this
+  number plus the two that serve normal tasks.
+   */
+  void set_max_low_running(uint64_t n);
+
   task_scheduler();
   ~task_scheduler();
 
@@ -188,8 +194,25 @@ task_scheduler<Task>::submit_low(Task task) {
   {
     std::unique_lock<mullion::mutex> lock(worker_mutex_);
     task_low_queue_.push_back(task);
+    // a low-priority task runs only on an idle worker: add one while fewer workers are idle than low-priority tasks
+    // wait, and the low limit allows more
+    uint64_t busy = std::min<uint64_t>(running.load(std::memory_order_relaxed), threads);
+    if (threads - busy < task_low_queue_.size() && threads < max_low_running_ + 2 && threads < max_threads) {
+      workers_.emplace_back([this]() { worker_func(); });
+      threads++;
+    }
   }
   worker_cond_.notify_one();
+}
+
+template <typename Task>
+void
+task_scheduler<Task>::set_max_low_running(uint64_t n) {
+  {
+    std::unique_lock<mullion::mutex> lock(worker_mutex_);
+    max_low_running_ = std::max<uint64_t>(1, n);
+  }
+  worker_cond_.notify_all();
 }
 
 template <typename Task>
