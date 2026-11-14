@@ -67,6 +67,9 @@ static cl::opt<bool>
 // SM50_SHADER_FLAG_SKIP_CBUFFER_BOUNDS, to see what a path switch of d3d11.dll changes (airconv_switches.hpp)
 static cl::opt<unsigned> ExtraShaderFlags("shader-flags", cl::init(0), cl::desc("SM50_SHADER_FLAG bits to add"));
 // SC6 fork: the Metal version the output targets (SM50_SHADER_METAL_VERSION), 400 as d3d11.dll uses on the SC6 machine
+// SC6 fork: a vertex shader packs its varyings and a pixel shader reads them packed, as d3d11.dll's
+// mullion.splitVaryings = False makes them for a pipeline without a geometry or tessellation stage
+static cl::opt<bool> PackedVaryings("packed-varyings", cl::init(false), cl::desc("Pack varyings into float4 registers"));
 static cl::opt<unsigned> MetalVersion("metal-version", cl::init(400), cl::desc("Metal version: 320 or 400"));
 
 // SC6 fork
@@ -505,8 +508,23 @@ int main(int argc, char **argv) {
       return 1;
     }
   } else {
+    // SC6 fork: --packed-varyings passes the data d3d11.dll passes a packed pipeline's shaders
+    SM50_SHADER_GS_PASS_THROUGH_DATA packed_vs{};
+    packed_vs.type = SM50_SHADER_GS_PASS_THROUGH;
+    packed_vs.DataEncoded = ~0u;
+    packed_vs.PackedVaryings = true;
+    SM50_SHADER_PSO_PIXEL_SHADER_DATA packed_ps{};
+    packed_ps.type = SM50_SHADER_PSO_PIXEL_SHADER;
+    packed_ps.sample_mask = 0xffffffff;
+    packed_ps.packed_varyings = true;
+    packed_vs.next = packed_ps.next = &data;
+    void *args = &data;
+    if (PackedVaryings)
+      args = ((mullion::dxbc::SM50ShaderInternal *)sm50)->shader_type == microsoft::D3D10_SB_PIXEL_SHADER
+                 ? (void *)&packed_ps
+                 : (void *)&packed_vs;
     if (auto err =
-          mullion::dxbc::convertDXBC(sm50, "shader_main", Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data)) {
+          mullion::dxbc::convertDXBC(sm50, "shader_main", Context, M, (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)args)) {
       errs() << toString(std::move(err)) << '\n';
       return 1;
     }

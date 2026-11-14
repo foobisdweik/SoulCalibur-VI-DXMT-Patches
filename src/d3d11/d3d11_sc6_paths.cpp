@@ -1,4 +1,5 @@
 #include "d3d11_sc6_paths.hpp"
+#include "d3d11_sc6_toggles.hpp"
 #include "config/config.hpp"
 #include "log/log.hpp"
 #include "util_env.hpp"
@@ -23,6 +24,8 @@ static const std::array<Sc6PathInfo, size_t(Sc6Path::Count)> kPaths = {{
     {"bounds-guard", "mullion.boundsGuard", SM50_SHADER_FLAG_SKIP_BOUNDS_GUARD},
     {"cbuffer-dwords", "mullion.cbufferDwords", SM50_SHADER_FLAG_SKIP_CBUFFER_DWORDS},
     {"unbound-drop", "mullion.unboundDrop", SM50_SHADER_FLAG_SKIP_UNBOUND_DROP},
+    /* in the shader variants' keys instead of the flags (ShaderVariantVertex's and ShaderVariantPixel's packed_varyings) */
+    {"split-varyings", "mullion.splitVaryings", SM50_SHADER_FLAG{}},
 }};
 
 const Sc6PathInfo &
@@ -61,8 +64,23 @@ EnabledPaths() {
     std::string off;
     for (size_t i = 0; i < kPaths.size(); i++) {
       auto &path = kPaths[i];
-      enabled[i] = config.getOption<bool>(path.option, true) && !ListNames(config_list, path.name) &&
-                   !ListNames(env_list, path.name);
+      // sc6-optimizations.ini's toggle, where it names the path's, decides in place of the config option; the lists
+      // still turn a path off
+      std::optional<bool> optimization;
+      switch (Sc6Path(i)) {
+      case Sc6Path::CbufferDwords: optimization = Sc6ToggleValue(Sc6Toggle::WholeRowConstantLoads); break;
+      case Sc6Path::SplitVaryings: optimization = Sc6ToggleValue(Sc6Toggle::PackedVaryings); break;
+      case Sc6Path::UnboundDrop: optimization = Sc6ToggleValue(Sc6Toggle::SkipUnboundSelect); break;
+      case Sc6Path::HoistLoads: optimization = Sc6ToggleValue(Sc6Toggle::SkipHoistLoads); break;
+      case Sc6Path::BoundsGuard: optimization = Sc6ToggleValue(Sc6Toggle::SkipBoundsGuard); break;
+      case Sc6Path::CbufferBounds:
+      case Sc6Path::AnisoGradients:
+        optimization = Sc6ToggleValue(Sc6Toggle::SkipCbufferBoundsAndLodGradients);
+        break;
+      default: break;
+      }
+      enabled[i] = (optimization ? !*optimization : config.getOption<bool>(path.option, true)) &&
+                   !ListNames(config_list, path.name) && !ListNames(env_list, path.name);
       if (!enabled[i])
         off += off.empty() ? path.name : std::string(", ") + path.name;
     }

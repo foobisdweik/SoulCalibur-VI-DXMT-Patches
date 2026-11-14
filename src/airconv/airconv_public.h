@@ -650,6 +650,10 @@ struct SM50_SHADER_PSO_PIXEL_SHADER_DATA {
      (SM50_SHADER_PSO_GEOMETRY_SHADER_DATA's conservative_hull), so the shader tests no pixel, and writes the depth
      only where Metal would clamp it otherwise: when the shader may discard or change its coverage, or writes memory */
   bool conservative_hull;
+  /* SC6 fork: the vertex function before this shader packs its varyings, one float4 a register, named
+     packed_varying_name (SM50_SHADER_GS_PASS_THROUGH_DATA's PackedVaryings): each input register is one float4 too. it
+     is set only where no input is pulled (EvaluateAttribute*, a partial sample mask's centroids) or read at a vertex */
+  bool packed_varyings;
 };
 
 /* conservative rasterization's per-primitive varyings, flat floats named "mullion_conservative0" and on: the corners
@@ -734,6 +738,10 @@ struct SM50_SHADER_GS_PASS_THROUGH_DATA {
   /* the cull distances leave as SM50_CULL_VARYING's too, which the pixel shader tests (SM50_SHADER_PSO_PIXEL_SHADER_DATA's
      cull_distances) */
   bool CullDistanceVaryings;
+  /* SC6 fork: the vertex function writes each varying register as one float4 (integers as their bits), as the old SC6
+     build did, in place of a float or uint for each component: a stage writes all four components of each register,
+     and Metal writes a split register's components one by one. the pipeline's pixel shader then has packed_varyings */
+  bool PackedVaryings;
 };
 
 /* a cull distance a pipeline's pixel shader tests (SM50_SHADER_PSO_PIXEL_SHADER_DATA's cull_distances): each is a float

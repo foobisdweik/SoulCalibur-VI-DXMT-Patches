@@ -4,6 +4,7 @@
 #include "config/config.hpp"
 #include "mullion_info.hpp"
 #include "d3d11_sc6_paths.hpp"
+#include "d3d11_sc6_toggles.hpp"
 #include "d3d11_input_layout.hpp"
 #include "sha1/sha1_util.hpp"
 #include <mutex>
@@ -105,6 +106,8 @@ public:
         shader_->dump();
       }
     }
+    // SC6 fork: sc6-optimizations.ini's Watch* lines for the converter toggles
+    Sc6WatchConvertedShader(sm50_common.flags, func_name);
 
     return this;
   }
@@ -133,6 +136,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
   h.update(variant.gs_passthrough);
   h.update(variant.rasterization_disabled);
   h.update(variant.clip_distance_varyings);
+  h.update(variant.packed_varyings);
   if (variant.input_layout_handle)
     h.update(variant.input_layout_handle->sha1());
   auto variant_digest = h.final();
@@ -146,6 +150,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     data_gs_passthrough.RasterizationDisabled = variant.rasterization_disabled;
     data_gs_passthrough.ClipDistanceVaryings = variant.clip_distance_varyings;
     data_gs_passthrough.CullDistanceVaryings = false;
+    data_gs_passthrough.PackedVaryings = variant.packed_varyings;
     data_gs_passthrough.next = common;
     if (variant.input_layout_handle) {
       data_gs_passthrough.next = &data_ia_layout;
@@ -191,6 +196,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
   h.update(variant.paired_samples);
   h.update(variant.clip_distances);
   h.update(variant.blend);
+  h.update(variant.packed_varyings);
   auto variant_digest = h.final();
   std::string func_name = "ps_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
 
@@ -219,6 +225,7 @@ CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
     data.coarse_shading = false;
     data.shading_rate_varying = 0;
     data.quad_lines = false;
+    data.packed_varyings = variant.packed_varyings;
 
     sm50_bitcode_t compile_result = nullptr;
     sm50_error_t sm50_err = nullptr;

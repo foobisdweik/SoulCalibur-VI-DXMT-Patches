@@ -4,6 +4,8 @@
 #include "d3d11_pipeline_archive.hpp"
 #include "d3d11_device.hpp"
 #include "d3d11_shader.hpp"
+#include "d3d11_sc6_paths.hpp"
+#include "d3d11_sc6_toggles.hpp"
 #include "log/log.hpp"
 #include <atomic>
 #include <chrono>
@@ -40,20 +42,40 @@ public:
       unorm_output_reg_mask |= (uint32_t(IsUnorm8RenderTargetFormat(pDesc->ColorAttachmentFormats[i])) << i);
     }
 
+    // SC6 fork: the vertex function packs its varyings, one float4 a register, where nothing between it and the pixel
+    // shader writes them on its own (no geometry shader of any kind) and the pixel shader takes every input as a plain
+    // one: it pulls none (FineShading also covers EvaluateAttribute*; a partial sample mask pulls centroids) and reads
+    // none at a vertex (mullion.splitVaryings, d3d11_sc6_paths.hpp)
+    bool packed_varyings = false;
+    const char *split_reason = "mullion.splitVaryings is on";
+    if (!Sc6PathEnabled(Sc6Path::SplitVaryings)) {
+      MTL_PIXEL_SHADER_REFLECTION ps = pDesc->PixelShader ? pDesc->PixelShader->reflection().PixelShader : MTL_PIXEL_SHADER_REFLECTION{};
+      split_reason = !pDesc->PixelShader || !pDesc->RasterizationEnabled ? "no pixel shader"
+                     : pDesc->GSPassthrough != ~0u || pDesc->GeometryShader ? "a geometry shader"
+                     : pDesc->SampleMask != 0xffffffff                       ? "a partial sample mask"
+                     : ps.FineShading                                         ? "the pixel shader evaluates or runs per sample"
+                     : ps.VertexValues                                        ? "the pixel shader reads inputs at vertices"
+                                                                              : nullptr;
+      packed_varyings = !split_reason;
+    }
+    Sc6WatchPackedVaryings(packed_varyings, split_reason);
+
     if (pDesc->GSPassthrough == kGSLayered && pDesc->GeometryShader)
       VertexShader = pDesc->VertexShader->get_shader(
           ShaderVariantGeometryLayeredVertex{pDesc->InputLayout, pDesc->GeometryShader});
     else
       VertexShader = pDesc->VertexShader->get_shader(ShaderVariantVertex{
-          pDesc->InputLayout, pDesc->GSPassthrough, !pDesc->RasterizationEnabled, pDesc->ClipDistances != 0});
+          pDesc->InputLayout, pDesc->GSPassthrough, !pDesc->RasterizationEnabled, pDesc->ClipDistances != 0,
+          packed_varyings});
 
     if (pDesc->PixelShader) {
-      PixelShader = pDesc->PixelShader->get_pixel_shader(ShaderVariantPixel{
+      ShaderVariantPixel variant{
           pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
           depth_stencil_format == WMTPixelFormatInvalid,
           unorm_output_reg_mask, pDesc->PipelineStatistics, pDesc->BlendState->IsAlphaToCoverage(),
-          pDesc->CenteredSamples, pDesc->SingleRasterSample, pDesc->PairedSamples, pDesc->ClipDistances},
-          {rtv_formats, num_rtvs}, pDesc->BlendState);
+          pDesc->CenteredSamples, pDesc->SingleRasterSample, pDesc->PairedSamples, pDesc->ClipDistances};
+      variant.packed_varyings = packed_varyings;
+      PixelShader = pDesc->PixelShader->get_pixel_shader(variant, {rtv_formats, num_rtvs}, pDesc->BlendState);
       ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
     } else {
       PixelShader = nullptr;

@@ -419,6 +419,11 @@ inline std::string
 varying_name(uint32_t reg, uint32_t component) {
   return "reg" + std::to_string(reg) + "_" + std::to_string(component);
 }
+// SC6 fork: a whole register as one float4 varying (SM50_SHADER_GS_PASS_THROUGH_DATA's PackedVaryings)
+inline std::string
+packed_varying_name(uint32_t reg) {
+  return "reg" + std::to_string(reg);
+}
 // a clip distance a pipeline's pixel shader tests itself (SM50_SHADER_PSO_PIXEL_SHADER_DATA::clip_distances)
 inline std::string
 clip_varying_name(uint32_t index) {
@@ -456,6 +461,8 @@ struct SignatureContext {
   bool shader_blends_dual_source;
   bool disable_depth_output;
   bool skip_vertex_output;
+  // SC6 fork: a pixel shader's input registers are float4 varyings (SM50_SHADER_PSO_PIXEL_SHADER_DATA's packed_varyings)
+  bool packed_varyings = false;
   uint32_t pull_mode_reg_mask;
   // centroid inputs are interpolated in the shader (llvm::air::AIRBuilder::CentroidCoverage)
   bool pull_centroids;

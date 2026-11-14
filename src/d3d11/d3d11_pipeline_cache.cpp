@@ -4,6 +4,7 @@
 #include "d3d11_shader.hpp"
 #include "d3d11_pipeline.hpp"
 #include "d3d11_pipeline_archive.hpp"
+#include "d3d11_sc6_toggles.hpp"
 #include "mullion_shader_cache.hpp"
 #include "mullion_stream_output.hpp"
 #include "DXBCParser/BlobContainer.h"
@@ -252,12 +253,17 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
   find these shaders by hash. Runs once, at the first shader or pipeline request, when the device is complete.
    */
   void StartEagerWarmUp() {
-    if (!archive_ || !Config::getInstance().getOption<bool>("d3d11.pipelineEagerWarmUp", true))
+    // SC6 fork: sc6-optimizations.ini's EagerWarmUp decides in place of the option
+    bool eager = Sc6ToggleValue(Sc6Toggle::EagerWarmUp)
+                     .value_or(Config::getInstance().getOption<bool>("d3d11.pipelineEagerWarmUp", true));
+    Sc6WatchLog(Sc6Toggle::EagerWarmUp, eager ? "on" : "off");
+    if (!archive_ || !eager)
       return;
     eager_ = mullion::thread([this]() {
       env::setThreadName("mullion-pso-prewarm");
       auto start = std::chrono::steady_clock::now();
       auto shaders = archive_->StoredShadersForWarmUp();
+      Sc6WatchLog(Sc6Toggle::EagerWarmUp, str::format("creating ", shaders.size(), " stored shaders"));
       unsigned created = 0;
       for (auto &[sha1, code] : shaders) {
         if (eager_stop_.load(std::memory_order_relaxed))
@@ -269,6 +275,26 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
       WARN("PipelineArchive: created ", created, " of ", shaders.size(), " stored shaders for warm-up in ", ms.count(),
            " ms");
       archive_->LogStats("after creating the stored shaders");
+      // SC6 fork: WatchEagerWarmUp and WatchWideWarmUpThreads follow the queued compiles until they are done
+      if (!Sc6Watch(Sc6Toggle::EagerWarmUp) && !Sc6Watch(Sc6Toggle::WideWarmUpThreads))
+        return;
+      uint64_t last_done = ~0ull;
+      for (unsigned idle = 0; idle < 30 && !eager_stop_.load(std::memory_order_relaxed);) {
+        ::Sleep(2000);
+        auto queued = archive_->WarmUpQueued(), done = archive_->WarmUpDone();
+        idle = done == last_done ? idle + 1 : 0;
+        if (done != last_done) {
+          auto s = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start);
+          Sc6WatchLog(Sc6Toggle::EagerWarmUp, str::format(done, " of ", queued, " queued pipelines done after ",
+                                                          s.count(), " s"));
+          Sc6WatchLog(Sc6Toggle::WideWarmUpThreads, str::format(scheduler_.get_running_threads(),
+                                                                " compile threads running"));
+        }
+        last_done = done;
+        if (queued && done >= queued)
+          break;
+      }
+      Sc6WatchLog(Sc6Toggle::EagerWarmUp, "every queued pipeline is done");
     });
   }
 
@@ -746,12 +772,20 @@ public:
       so_layouts(pDevice) {
     // SC6 fork: warm-up compiles may use all but 2 cores (d3d11.pipelineWarmUpThreads; 0 = that default). They
     // run only while no compile that the game waits for is queued.
-    if (archive_) {
+    // sc6-optimizations.ini's WideWarmUpThreads = false keeps the scheduler's own limit
+    bool wide = Sc6ToggleValue(Sc6Toggle::WideWarmUpThreads).value_or(true);
+    if (archive_ && wide) {
       int n = Config::getInstance().getOption<int>("d3d11.pipelineWarmUpThreads", 0);
       if (n <= 0)
         n = std::max<int>(1, (int)mullion::thread::hardware_concurrency() - 2);
       scheduler_.set_max_low_running(n);
+      Sc6WatchLog(Sc6Toggle::WideWarmUpThreads, str::format("on: at most ", n, " warm-up compiles at once"));
+    } else {
+      Sc6WatchLog(Sc6Toggle::WideWarmUpThreads, "off: the scheduler's own limit for warm-up compiles");
     }
+    Sc6WatchLog(Sc6Toggle::PostProcessingOff, str::format(
+        "sc6-optimizations.ini says ", Sc6ToggleValue(Sc6Toggle::PostProcessingOff).value_or(true) ? "on" : "off",
+        "; the SC6-VRR scripts apply it to Engine.ini while the game is closed"));
   }
 
   ~PipelineCache() {

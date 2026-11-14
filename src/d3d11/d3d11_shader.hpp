@@ -103,11 +103,13 @@ struct ShaderVariantVertex {
   uint32_t gs_passthrough;
   bool rasterization_disabled;
   bool clip_distance_varyings;
+  /* SC6 fork: the varyings leave packed, one float4 a register (SM50_SHADER_GS_PASS_THROUGH_DATA's PackedVaryings) */
+  bool packed_varyings = false;
   bool operator==(const this_type &rhs) const {
     return input_layout_handle == rhs.input_layout_handle &&
            gs_passthrough == rhs.gs_passthrough &&
            rasterization_disabled == rhs.rasterization_disabled &&
-           clip_distance_varyings == rhs.clip_distance_varyings;
+           clip_distance_varyings == rhs.clip_distance_varyings && packed_varyings == rhs.packed_varyings;
   }
 };
 
@@ -125,6 +127,8 @@ struct ShaderVariantPixel {
   uint32_t clip_distances = 0;
   std::array<uint32_t, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.pixel_formats)> pixel_formats{};
   std::array<SM50_SHADER_BLEND, std::size(SM50_SHADER_PSO_PIXEL_SHADER_DATA{}.blend)> blend{};
+  /* SC6 fork: the inputs come packed (SM50_SHADER_PSO_PIXEL_SHADER_DATA's packed_varyings) */
+  bool packed_varyings = false;
   bool operator==(const this_type &rhs) const = default;
 };
 

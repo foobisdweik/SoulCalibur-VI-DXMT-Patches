@@ -74,6 +74,8 @@ namespace mullion {
       { "mullion.anisoGradients",          "False" },
       /* the old SC6 build loaded whole constant buffer rows; per-dword loads made SC6's GPU code 3% larger */
       { "mullion.cbufferDwords",           "False" },
+      /* the old SC6 build passed varyings as float4 registers; split ones made SC6's GPU code 12% larger */
+      { "mullion.splitVaryings",           "False" },
     }} },
   }};
 

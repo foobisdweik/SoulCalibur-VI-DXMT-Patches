@@ -1654,6 +1654,7 @@ public:
       std::string ps_name = "ps_main" + sha1.string().substr(0, 8);
 
       SM50_SHADER_PSO_PIXEL_SHADER_DATA data_ps;
+      data_ps.packed_varyings = false;
       data_ps.dual_source_blending = dual_source_blending;
       data_ps.disable_depth_output =
           (mesh ? mesh_info.depth_pixel_format : info.depth_pixel_format) == WMTPixelFormatInvalid;

@@ -38,6 +38,9 @@ enum class Sc6Path : unsigned {
   CbufferDwords,
   /* every texture call drops what an unbound texture's stand-in answers, so an unbound slot reads 0 (D3D11.3 22.4.22) */
   UnboundDrop,
+  /* each varying component passes on its own, in place of one float4 a register (SM50_SHADER_GS_PASS_THROUGH_DATA's
+     PackedVaryings, for pipelines without a geometry or tessellation stage) */
+  SplitVaryings,
   Count,
 };
 

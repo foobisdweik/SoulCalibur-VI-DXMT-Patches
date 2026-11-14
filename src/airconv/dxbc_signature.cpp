@@ -383,6 +383,18 @@ void handle_signature_ps(
       bool pull_mode = (bool(ctx.pull_mode_reg_mask & (1 << reg)) || (ctx.pull_centroids && centroid)) &&
                        interpolation != air::Interpolation::flat;
       bool vertex_value = sm50_shader->shader_info.vertex_value_reg_mask >> reg & 1;
+      // SC6 fork: the register is one float4 varying, which the vertex function writes whole. d3d11.dll packs no
+      // pipeline whose pixel shader pulls an input or reads one at a vertex, so neither path takes a float4
+      if (ctx.packed_varyings) {
+        if (pull_mode || vertex_value)
+          Refuse("packed varyings with an input that is pulled or read at a vertex");
+        auto assigned_index = ctx.func_signature.DefineInput(InputFragmentStageIn{
+            .user = packed_varying_name(reg), .type = air::msl_float4, .interpolation = interpolation,
+            .pull_mode = false
+        });
+        ctx.prologue << init_input_reg(assigned_index, reg, mask);
+        return;
+      }
       for (unsigned c = 0; c < 4; c++) {
         if (!(mask >> c & 1))
           continue;

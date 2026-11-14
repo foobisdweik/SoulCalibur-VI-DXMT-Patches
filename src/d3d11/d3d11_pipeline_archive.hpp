@@ -142,6 +142,11 @@ public:
   void OnShaderCreated(const Sha1Digest &shader, std::vector<PipelineRecord> &ready);
 
   void OnWarmUpQueued() { warm_queued_.fetch_add(1, std::memory_order_relaxed); }
+  /* SC6 fork: recorded pipelines queued for warm-up, and those finished or failed */
+  uint64_t WarmUpQueued() const { return warm_queued_.load(std::memory_order_relaxed); }
+  uint64_t WarmUpDone() const {
+    return warm_finished_.load(std::memory_order_relaxed) + warm_failed_.load(std::memory_order_relaxed);
+  }
   void OnWarmUpFinished(bool success);
 
   /**

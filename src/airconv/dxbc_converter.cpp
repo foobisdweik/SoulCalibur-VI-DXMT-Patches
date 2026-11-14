@@ -640,6 +640,7 @@ llvm::Error convert_dxbc_pixel_shader(
     sig_ctx.disable_depth_output = pso_disable_depth_output || early_tests;
     sig_ctx.pull_mode_reg_mask = shader_info->pull_mode_reg_mask;
     sig_ctx.pull_centroids = pso_sample_mask != 0xffffffff;
+    sig_ctx.packed_varyings = pso_data && pso_data->packed_varyings;
     sig_ctx.barycentric_rows = pso_data && (pso_data->quad_lines || pso_data->conservative);
     sig_ctx.unorm_output_reg_mask = pso_unorm_output_reg_mask;
     if (pso_pixel_formats)
@@ -1360,6 +1361,8 @@ llvm::Error convert_dxbc_vertex_shader(
   bool rasterization_disabled =
       args_get_data<SM50_SHADER_GS_PASS_THROUGH, SM50_SHADER_GS_PASS_THROUGH_DATA>(pArgs, &gs_passthrough) &&
       gs_passthrough->RasterizationDisabled;
+  // SC6 fork: SM50_SHADER_GS_PASS_THROUGH_DATA's PackedVaryings
+  bool packed_varyings = gs_passthrough && gs_passthrough->PackedVaryings && !rasterization_disabled;
   SM50_SHADER_METAL_VERSION metal_version = SM50_SHADER_METAL_310;
   SM50_SHADER_FLAG shader_flags = {};
   SM50_SHADER_COMMON_DATA *sm50_common = nullptr;
@@ -1604,6 +1607,56 @@ llvm::Error convert_dxbc_vertex_shader(
       );
     }
     builder.CreateRet(value);
+  }
+
+  if (packed_varyings && value) {
+    // SC6 fork: the function above writes each varying component on its own (varying_name). a wrapper with the same
+    // inputs packs each register's four into one float4 (packed_varying_name), integers as their bits, and the always
+    // inliner merges the two. the other outputs keep their order
+    air::FunctionSignatureBuilder packed_signature = func_signature;
+    packed_signature.ClearOutputs();
+    struct Place {
+      uint32_t index;
+      int component;
+    };
+    std::vector<Place> places;
+    for (auto &out : func_signature.Outputs()) {
+      unsigned reg, component;
+      char rest;
+      auto vertex = std::get_if<air::OutputVertex>(&out);
+      if (vertex && sscanf(vertex->user.c_str(), "reg%u_%u%c", &reg, &component, &rest) == 2 && component < 4)
+        places.push_back(
+            {packed_signature.DefineOutput(air::OutputVertex{.user = packed_varying_name(reg), .type = air::msl_float4}),
+             int(component)}
+        );
+      else
+        places.push_back({packed_signature.DefineOutput(out), -1});
+    }
+    function->setName(std::string(name) + ".split");
+    function->setLinkage(llvm::GlobalValue::InternalLinkage);
+    function->addFnAttr(llvm::Attribute::AlwaysInline);
+    auto [packed_function, packed_metadata] =
+        packed_signature.CreateFunction(name, context, module, 0, rasterization_disabled);
+    llvm::IRBuilder<> wrap(llvm::BasicBlock::Create(context, "entry", packed_function));
+    llvm::SmallVector<llvm::Value *, 32> args;
+    for (auto &arg : packed_function->args())
+      args.push_back(&arg);
+    auto split = wrap.CreateCall(function, args);
+    llvm::Value *packed = llvm::ConstantAggregateZero::get(packed_function->getReturnType());
+    for (unsigned i = 0; i < places.size(); i++) {
+      llvm::Value *element = wrap.CreateExtractValue(split, {i});
+      if (places[i].component < 0) {
+        packed = wrap.CreateInsertValue(packed, element, {places[i].index});
+        continue;
+      }
+      if (!element->getType()->isFloatTy())
+        element = wrap.CreateBitCast(element, types._float);
+      auto vector = wrap.CreateExtractValue(packed, {places[i].index});
+      vector = wrap.CreateInsertElement(vector, element, uint64_t(places[i].component));
+      packed = wrap.CreateInsertValue(packed, vector, {places[i].index});
+    }
+    wrap.CreateRet(packed);
+    function_metadata = packed_metadata;
   }
 
   module.getOrInsertNamedMetadata("air.vertex")->addOperand(function_metadata);
