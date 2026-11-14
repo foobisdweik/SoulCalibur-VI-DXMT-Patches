@@ -28,3 +28,4 @@ __pycache__/
 /SC6-Apple.gpr
 /SC6-Apple.lock*
 tools/pad-watch/pad-watch
+tools/profile/bin/
