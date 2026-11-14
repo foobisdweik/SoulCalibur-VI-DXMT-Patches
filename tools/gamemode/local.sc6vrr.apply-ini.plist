@@ -16,6 +16,7 @@
 	<key>WatchPaths</key>
 	<array>
 		<string>/Users/iphoobis/Library/Application Support/CrossOver/Bottles/SC6-FEX/drive_c/Games/SoulCalibur 6/SoulcaliburVI/Binaries/Win64/sc6vrr.ini</string>
+		<string>/Users/iphoobis/Library/Application Support/CrossOver/Bottles/SC6-FEX/drive_c/Games/SoulCalibur 6/SoulcaliburVI/Binaries/Win64/sc6-optimizations.ini</string>
 	</array>
 </dict>
 </plist>
