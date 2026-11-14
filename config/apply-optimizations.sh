@@ -1,7 +1,8 @@
 #!/bin/zsh
 # Apply the parts of sc6-optimizations.ini (next to SoulcaliburVI.exe) that
-# d3d11.dll cannot apply itself. d3d11.dll reads every other toggle when the
-# game starts (src/d3d11/d3d11_sc6_toggles.hpp in dxmt-SC6).
+# d3d11.dll cannot apply itself. d3d11.dll reads every other toggle, and
+# follows changes to the file while the game runs
+# (src/d3d11/d3d11_sc6_toggles.hpp in dxmt-SC6).
 #
 #   PostProcessingOff = true    merge config/Engine.SystemSettings.ini into the
 #                               game's Engine.ini (apply-system-settings.sh)
