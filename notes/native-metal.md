@@ -14,7 +14,7 @@ HDR, ProMotion, and interpolation stay deferred. The first renderer targets SDR 
 | `metal-shaderconverter` | `4.0.1` | Converts DXIL (the shader format of Direct3D 12) to a metal library. This meets the target of 4.0 beta 2 or newer. |
 | `dxc` | `1.9.0.5512` | Compiles HLSL source. Its `-metal` option can produce Metal output. It cannot read compiled game shaders. |
 | `spirv-cross` and SPIR-V tools | Homebrew | Convert SPIR-V (a portable shader format) to MSL. |
-| DXMT `airconv` | fork at `~/Projects/dxmt-SC6` | Converts DXBC (the shader format of Direct3D 11) directly to AIR. It already converts SC6's shaders on this Mac. |
+| DXMT `airconv` | fork at `~/Developer/SoulCalibur-VI-DXMT-Patches/dxmt` | Converts DXBC (the shader format of Direct3D 11) directly to AIR. It already converts SC6's shaders on this Mac. |
 
 SC6 uses Direct3D 11 with DXBC shaders ([dxmt.md](dxmt.md)).
 Metal Shader Converter accepts DXIL, not DXBC. So that path needs a DXBC-to-DXIL step, and no such tool is installed.

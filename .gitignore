@@ -29,3 +29,11 @@ __pycache__/
 /SC6-Apple.lock*
 tools/pad-watch/pad-watch
 tools/profile/bin/
+
+# Mega-repo: large or machine-local folders (README.md, Layout)
+/toolchains/
+/reference/
+/data/
+/.claude/
+dxmt/install-mm/
+dxmt/.cache/

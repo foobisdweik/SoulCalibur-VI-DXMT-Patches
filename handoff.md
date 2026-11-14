@@ -57,8 +57,8 @@ Current result (measured, see `notes/test-results.md`):
 
 | Repo | Path | Branch | State |
 | --- | --- | --- | --- |
-| SC6-VRR | `/Users/iphoobis/Projects/SC6-VRR` | `main` at `38dba1d` | 22 commits ahead of `origin/main` (`foobisdweik/SC6-VRR`), **not pushed**. The user asked not to push yet. |
-| DXMT fork | `/Users/iphoobis/Projects/dxmt-SC6` | `sc6/native-fullscreen` at `1029cba` | Local only, not pushed. Upstream `AGENTS.md` bans AI-generated contributions, so none of this goes upstream. |
+| SC6-VRR | `/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches` | `main` at `38dba1d` | 22 commits ahead of `origin/main` (`foobisdweik/SC6-VRR`), **not pushed**. The user asked not to push yet. |
+| DXMT fork | `/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/dxmt` | `sc6/native-fullscreen` at `1029cba` | Local only, not pushed. Upstream `AGENTS.md` bans AI-generated contributions, so none of this goes upstream. |
 
 Other branches:
 

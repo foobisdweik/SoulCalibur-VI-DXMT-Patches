@@ -2,7 +2,7 @@
 
 ## Installed build
 
-The custom source is `/Users/iphoobis/Projects/dxmt-SC6`.
+The custom source is `/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/dxmt`.
 The branch is `codex/sc6-204-230-228-222`.
 The installed commit is `000e282f4f79597a609b95407c808590331a17d9`.
 The build reports `v0.80-283-g000e282`.

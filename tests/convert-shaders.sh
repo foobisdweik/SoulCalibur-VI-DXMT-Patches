@@ -17,7 +17,7 @@ set -euo pipefail
 
 here=${0:A:h}
 bottle=${SC6_BOTTLE:-SC6-Rosetta}
-airconv=${AIRCONV:-$HOME/Projects/dxmt-SC6/build/src/airconv/darwin/airconv}
+airconv=${AIRCONV:-$here/../dxmt/build-mm/src/airconv/darwin/airconv}
 src="$HOME/Library/Application Support/SC6-VRR/native-investigation/shaders/$bottle"
 out=$src/convert-airconv
 jobs=${JOBS:-8}

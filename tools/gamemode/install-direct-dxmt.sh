@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Install the custom build into Preview's x86-64 DXMT, with backups.
 set -euo pipefail
-source_root=${SC6_DXMT_SOURCE:-$HOME/Projects/dxmt-SC6}
+source_root=${SC6_DXMT_SOURCE:-${0:A:h}/../../dxmt}
 runtime=${SC6_DXMT_RUNTIME:-$HOME/Library/Application Support/SC6-VRR/runtimes/dxmt-direct-x86_64}
 cx_root=${CROSSOVER_APP:-/Applications/CrossOver Preview.app}/Contents/SharedSupport/CrossOver
 payload=(d3d10/d3d10core.dll d3d11/d3d11.dll dxgi/dxgi.dll winemetal/winemetal.dll nvapi/nvapi64.dll nvngx/nvngx.dll)

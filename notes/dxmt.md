@@ -1,6 +1,6 @@
 # DXMT changes for SC6
 
-Fork: `/Users/iphoobis/Projects/dxmt-SC6` (`foobisdweik/dxmt-SC6`). On 2026-10-15, all six branches were identical to upstream `3Shain/dxmt` (GitHub compare: ahead 0, behind 0). `foobisdweik/dxmt-exp` `main` was identical too. So the DXMT in CrossOver (built 2026-10-13) is very probably stock upstream.
+Fork: `/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/dxmt` (`foobisdweik/dxmt-SC6`). On 2026-10-15, all six branches were identical to upstream `3Shain/dxmt` (GitHub compare: ahead 0, behind 0). `foobisdweik/dxmt-exp` `main` was identical too. So the DXMT in CrossOver (built 2026-10-13) is very probably stock upstream.
 
 Upstream `AGENTS.md` says that AI must not generate code for contributions to that project. So changes made with Claude stay in this fork and are never sent upstream.
 

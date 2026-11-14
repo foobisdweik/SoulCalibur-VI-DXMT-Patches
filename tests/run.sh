@@ -174,7 +174,7 @@ print -rl -- $env_list > $run_dir/env.txt
   print "selected d3d11.dll sha256: $(shasum -a 256 $backend_dll | cut -d' ' -f1)"
   print "crossover: $(plutil -extract CFBundleShortVersionString raw $crossover_app/Contents/Info.plist)"
   print "dxmt d3d11.dll sha256: $(shasum -a 256 $cx_root/lib/dxmt/x86_64-windows/d3d11.dll | cut -d' ' -f1)"
-  print "dxmt-SC6 HEAD: $(git -C $HOME/Projects/dxmt-SC6 log -1 --format='%h %s' 2>/dev/null)"
+  print "dxmt-SC6 HEAD: $(git -C $here/../dxmt log -1 --format='%h %s' 2>/dev/null)"
   print "exe sha256: $(shasum -a 256 $game_exe | cut -d' ' -f1)"
   if [[ -f ${game_exe:h}/dinput8.dll ]]; then
     print "sc6vrr DLL sha256: $(shasum -a 256 ${game_exe:h}/dinput8.dll | cut -d' ' -f1)"

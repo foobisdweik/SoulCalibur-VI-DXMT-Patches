@@ -25,11 +25,11 @@ The CPU summary averages rows from different processes. Therefore, an almost idl
 
 The frame-rate summary joins counters without distinguishing their separate sequences. In test 09, a counter changes from 0 to 4,455 within 0.937 seconds. The formula reports 4,754.5 fps. Therefore, the reported average of 131.5 fps is unreliable. The cause of the counter discontinuity remains unknown.
 
-Sources: [CPU summary](/Users/iphoobis/Projects/SC6-VRR/tests/summarize.sh:55), [frame-rate summary](/Users/iphoobis/Projects/SC6-VRR/tests/summarize.sh:64), and [counter discontinuity](/Users/iphoobis/Projects/SC6-VRR/tests/runs/20261015-161538-09-profile-battle/metal.log:165).
+Sources: [CPU summary](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/tests/summarize.sh:55), [frame-rate summary](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/tests/summarize.sh:64), and [counter discontinuity](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/tests/runs/20261015-161538-09-profile-battle/metal.log:165).
 
 Case 09 repeatedly pauses the game while `sample` examines it. The notes report 3–10 fps during these windows. Its thread shares suggest where to investigate, but they do not establish normal performance. The proposed benefit from Preview remains a hypothesis.
 
-Source: [recorded profiling limits](/Users/iphoobis/Projects/SC6-VRR/notes/test-results.md:27).
+Source: [recorded profiling limits](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/notes/test-results.md:27).
 
 ### 2. Complete the clock requirements before relying on the timing log
 
@@ -46,7 +46,7 @@ This model checks arithmetic only. It does not verify the game or its hooks. A h
 
 Changing `if` to `while` cannot solve the complete problem. The implementation needs a path that executes every required battle system for each released step. The current log counts released steps before battle code runs. Therefore, it cannot prove that the actual battle counters advanced.
 
-Sources: [scheduler and log](/Users/iphoobis/Projects/SC6-VRR/dll/src/sc6vrr.c:289) and [required counter tests](/Users/iphoobis/Projects/SC6-VRR/PLAN.md:86).
+Sources: [scheduler and log](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/dll/src/sc6vrr.c:289) and [required counter tests](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/PLAN.md:86).
 
 ### 3. Make incomplete setup preserve stock timing
 
@@ -56,13 +56,13 @@ Some hook creation results are unchecked. Earlier changes are not consistently r
 
 The DLL has no check that restores stock behavior during online play. This differs from the design in `PLAN.md`.
 
-Sources: [setup failure path](/Users/iphoobis/Projects/SC6-VRR/dll/src/sc6vrr.c:332), [patch installation](/Users/iphoobis/Projects/SC6-VRR/dll/src/sc6vrr.c:226), and [online requirement](/Users/iphoobis/Projects/SC6-VRR/PLAN.md:52).
+Sources: [setup failure path](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/dll/src/sc6vrr.c:332), [patch installation](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/dll/src/sc6vrr.c:226), and [online requirement](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/PLAN.md:52).
 
 ### 4. Preserve short input transitions
 
 The DLL does not retain presses and releases between battle steps. The game may already preserve some transitions, but this analysis did not establish that behavior. Trace where the game polls input and where battle code consumes it before adding the merge.
 
-Source: [input and battle gates](/Users/iphoobis/Projects/SC6-VRR/dll/src/sc6vrr.c:119).
+Source: [input and battle gates](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/dll/src/sc6vrr.c:119).
 
 ### 5. Resolve the interpolation fields before writing to them
 
@@ -76,7 +76,7 @@ The camera documentation provides a candidate boundary: `UWorld::Tick` commits c
 
 The delay requirement needs a precise definition. Blending previous and current completed states can display an older state than the current simulation. This is an inference from the proposed algorithm. Measure the delay between input and the visible response before claiming that interpolation adds no delay.
 
-Sources: [position fields](/Users/iphoobis/Projects/SC6-VRR/SC6-docs/docs/sc6/structures.md:200), [physics writes](/Users/iphoobis/Projects/SC6-VRR/SC6-docs/docs/sc6/movement.md:51), [animation fields](/Users/iphoobis/Projects/SC6-VRR/SC6-docs/docs/sc6/structures.md:1513), and [camera path](/Users/iphoobis/Projects/SC6-VRR/SC6-docs/docs/sc6/structures.md:809).
+Sources: [position fields](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/SC6-docs/docs/sc6/structures.md:200), [physics writes](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/SC6-docs/docs/sc6/movement.md:51), [animation fields](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/SC6-docs/docs/sc6/structures.md:1513), and [camera path](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/SC6-docs/docs/sc6/structures.md:809).
 
 ### 6. Preserve the archive between paired runs
 
@@ -90,7 +90,7 @@ Add an explicit choice between clearing and preserving caches. Record the instal
 
 The implementation starts preparation when the game creates every shader needed by a recorded pipeline. Therefore, it does not guarantee that preparation finishes before gameplay. Compare queued, finished, and failed counts with archive hits and misses.
 
-Sources: [cache deletion](/Users/iphoobis/Projects/SC6-VRR/tests/run.sh:104), [archive paths](/Users/iphoobis/Projects/dxmt-SC6/src/d3d11/d3d11_pipeline_archive.cpp:245), and [pipeline preparation](/Users/iphoobis/Projects/dxmt-SC6/src/d3d11/d3d11_pipeline_archive.cpp:501).
+Sources: [cache deletion](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/tests/run.sh:104), [archive paths](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/dxmt/src/d3d11/d3d11_pipeline_archive.cpp:245), and [pipeline preparation](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/dxmt/src/d3d11/d3d11_pipeline_archive.cpp:501).
 
 ### 7. Treat Preview as a separate experiment
 
@@ -102,7 +102,7 @@ ARM64EC is the Windows architecture that lets ARM64 code interoperate with x64 c
 
 The checked toolchains lack the required ARM64EC compiler and the separate ARM64 LLVM build. The existing LLVM build targets x86_64. The configured build therefore needs additional prerequisites before compilation can begin.
 
-Sources: [launch selection](/Users/iphoobis/Projects/SC6-VRR/tests/run.sh:80), [Preview host selection](</Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/bin/wine:665>), and [ARM64EC build configuration](/Users/iphoobis/Projects/dxmt-SC6/build-arm64ec.txt:1).
+Sources: [launch selection](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/tests/run.sh:80), [Preview host selection](</Applications/CrossOver Preview.app/Contents/SharedSupport/CrossOver/bin/wine:665>), and [ARM64EC build configuration](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/dxmt/build-arm64ec.txt:1).
 
 ### 8. Keep GPU estimates separate from measured improvements
 
@@ -112,7 +112,7 @@ One candidate could preserve image quality: avoid loading old pixels when a pass
 
 Measure GPU time and the interval between frames in the same Training scene first. A 120 fps target allows approximately 8.33 ms per frame. If GPU work exceeds that budget, inspect which passes consume the time. The existing menu measurement cannot establish the battle cost.
 
-Sources: [report scope](/Users/iphoobis/Projects/SC6-VRR/.claude/worktrees/gpu-analysis-fd2c4c/notes/gpu-analysis.md:5) and [pixel-load candidate](/Users/iphoobis/Projects/SC6-VRR/.claude/worktrees/gpu-analysis-fd2c4c/notes/gpu-analysis.md:186).
+Sources: [report scope](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/.claude/worktrees/gpu-analysis-fd2c4c/notes/gpu-analysis.md:5) and [pixel-load candidate](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/.claude/worktrees/gpu-analysis-fd2c4c/notes/gpu-analysis.md:186).
 
 ## Work packages and dependencies
 
@@ -132,7 +132,7 @@ Packages 6 and 7 test different effects. The archive may reduce compilation stal
 
 Two further checks belong in package 1. First, `BM_Update_Impl` is gated even though its timers use engine delta time. If each call receives only the current render interval, its timers may advance too slowly. This remains unverified. Second, the launchers restore Game Mode to automatic rather than restoring the previous policy. They need coordination if sessions overlap.
 
-Sources: [timer assumptions](/Users/iphoobis/Projects/SC6-VRR/notes/frame-cap.md:63), [harness restoration](/Users/iphoobis/Projects/SC6-VRR/tests/run.sh:170), and [launcher restoration](/Users/iphoobis/Projects/SC6-VRR/tools/gamemode/build-app.sh:60).
+Sources: [timer assumptions](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/notes/frame-cap.md:63), [harness restoration](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/tests/run.sh:170), and [launcher restoration](/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/tools/gamemode/build-app.sh:60).
 
 Update status documents as these packages finish. `notes/dxmt.md` still describes some implemented source changes as plans. Record three separate states: implemented in source, installed locally, and verified in the game. These states currently differ.
 

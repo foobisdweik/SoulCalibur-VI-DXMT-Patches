@@ -4,3 +4,9 @@
 [submodule "SC6-docs"]
 	path = SC6-docs
 	url = https://github.com/FottenSC/SC6ModdingDocs.git
+[submodule "dxmt/external/nvapi"]
+	path = dxmt/external/nvapi
+	url = https://github.com/NVIDIA/nvapi.git
+[submodule "dxmt/include/native/directx"]
+	path = dxmt/include/native/directx
+	url = https://github.com/misyltoad/mingw-directx-headers

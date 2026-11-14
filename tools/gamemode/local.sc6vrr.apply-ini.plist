@@ -7,7 +7,7 @@
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/zsh</string>
-		<string>/Users/iphoobis/Developer/SC6-VRR/dll/apply-ini.sh</string>
+		<string>/Users/iphoobis/Developer/SoulCalibur-VI-DXMT-Patches/dll/apply-ini.sh</string>
 	</array>
 	<key>StandardErrorPath</key>
 	<string>/Users/iphoobis/Library/Logs/sc6vrr-apply-ini.log</string>
