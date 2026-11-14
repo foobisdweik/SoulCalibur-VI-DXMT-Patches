@@ -118,6 +118,7 @@ public:
       d3dmt_(this, mutex),
       video_(this) {
         ignore_map_flag_no_wait_ = Config::getInstance().getOption<bool>("d3d11.ignoreMapFlagNoWait", false);
+        coherent_event_ = Config::getInstance().getOption<bool>("d3d11.coherentEventCompletion", true);
       }
 
   HRESULT
@@ -406,17 +407,23 @@ public:
     switch (desc.Query) {
     case D3D11_QUERY_TIMESTAMP_DISJOINT:
     case D3D11_QUERY_EVENT: {
+      /* upstream DXMT PR 251 (d3d11.coherentEventCompletion): a coherent event names the command chunk that holds
+         it, and completes once the finish thread has handled that chunk. The finish thread also completes the
+         chunk's timestamp and other queries first, so an event that completes implies every earlier query did, as
+         on Windows. Without it, the event signals from the GPU, which can be before the finish thread fills those
+         queries. */
       if (ctx_state.has_dirty_op_since_last_event) {
-        auto event_id = cmd_queue.GetNextEventSeqId();
+        auto event_id = coherent_event_ ? cmd_queue.CurrentSeqId() : cmd_queue.GetNextEventSeqId();
         static_cast<MTLD3D11EventQuery *>(pAsync)->Issue(event_id);
         InvalidateCurrentPass(true);
-        EmitOP([event_id](ArgumentEncodingContext &enc) mutable {
-          enc.signalEvent(event_id);
-        });
         promote_flush = true;
-        ctx_state.has_dirty_op_since_last_event = false;
+        if (!coherent_event_) {
+          EmitOP([event_id](ArgumentEncodingContext &enc) mutable { enc.signalEvent(event_id); });
+          ctx_state.has_dirty_op_since_last_event = false;
+        }
       } else {
-        static_cast<MTLD3D11EventQuery *>(pAsync)->Issue(cmd_queue.GetCurrentEventSeqId());
+        auto event_id = coherent_event_ ? cmd_queue.CurrentSeqId() - 1 : cmd_queue.GetCurrentEventSeqId();
+        static_cast<MTLD3D11EventQuery *>(pAsync)->Issue(event_id);
       }
       break;
     }
@@ -504,7 +511,8 @@ public:
     switch (desc.Query) {
     case D3D11_QUERY_EVENT:
     case D3D11_QUERY_TIMESTAMP_DISJOINT: {
-      switch (static_cast<MTLD3D11EventQuery *>(pAsync)->CheckEventState(cmd_queue.SignaledEventSeqId())) {
+      auto event_id = coherent_event_ ? cmd_queue.CoherentSeqId() : cmd_queue.SignaledEventSeqId();
+      switch (static_cast<MTLD3D11EventQuery *>(pAsync)->CheckEventState(event_id)) {
       case EventState::Pending:
         break;
       case EventState::Stall:
@@ -894,6 +902,7 @@ private:
   D3D11Multithread d3dmt_;
   D3D11VideoContext video_;
   bool ignore_map_flag_no_wait_;
+  bool coherent_event_;
 };
 
 std::unique_ptr<MTLD3D11DeviceContextBase>
