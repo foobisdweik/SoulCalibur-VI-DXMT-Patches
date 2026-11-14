@@ -4,6 +4,7 @@
 #include "d3d11_shader.hpp"
 #include "d3d11_pipeline.hpp"
 #include "d3d11_pipeline_archive.hpp"
+#include "d3d11_sc6_paths.hpp"
 #include "d3d11_sc6_toggles.hpp"
 #include "mullion_shader_cache.hpp"
 #include "mullion_stream_output.hpp"
@@ -77,6 +78,37 @@ template <> struct task_trait<ThreadpoolWork *> {
   void set_done(ThreadpoolWork *task) { task->SetIsDone(true); }
 };
 
+/* SC6 fork: a shader variant under the sc6-optimizations.ini settings it was converted with (Sc6SettingsKey()), so a
+   reload of the file converts the variant again */
+struct SettingsVariant {
+  uint64_t settings;
+  ShaderVariant variant;
+  bool operator==(const SettingsVariant &) const = default;
+};
+struct SettingsVariantHash {
+  size_t operator()(const SettingsVariant &v) const noexcept {
+    HashState state;
+    state.add((size_t)v.settings);
+    state.add(std::hash<ShaderVariant>{}(v.variant));
+    return state;
+  }
+};
+
+// SC6 fork: a compute pipeline under its settings, as SettingsVariant
+struct SettingsComputeShader {
+  uint64_t settings;
+  ManagedShader shader;
+  bool operator==(const SettingsComputeShader &) const = default;
+};
+struct SettingsComputeShaderHash {
+  size_t operator()(const SettingsComputeShader &v) const noexcept {
+    HashState state;
+    state.add((size_t)v.settings);
+    state.add((size_t)v.shader);
+    return state;
+  }
+};
+
 class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   class CachedSM50Shader final : public Shader {
@@ -85,7 +117,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     Sha1Digest sha1_;
     MTL_SHADER_REFLECTION reflection_;
     MTL_SM50_SHADER_ARGUMENT *arguments_info_buffer;
-    std::unordered_map<ShaderVariant, std::unique_ptr<CompiledShader>> variants;
+    std::unordered_map<SettingsVariant, std::unique_ptr<CompiledShader>, SettingsVariantHash> variants;
     // a pipeline asks for variants where it is made, and again where it is built
     mullion::mutex variants_mutex;
 
@@ -128,7 +160,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
     };
     virtual CompiledShader *get_shader(ShaderVariant variant) {
       std::lock_guard<mullion::mutex> lock(variants_mutex);
-      auto c = variants.insert({variant, nullptr});
+      auto c = variants.insert({SettingsVariant{Sc6SettingsKey(), variant}, nullptr});
       if (c.second) {
         c.first->second = std::visit(
             [=, this](auto var) {
@@ -230,7 +262,8 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
   std::unordered_map<MTL_GRAPHICS_PIPELINE_DESC, std::unique_ptr<MTLCompiledTessellationMeshPipeline>> pipelines_ts_;
   mullion::mutex mutex_ts_;
 
-  std::unordered_map<ManagedShader, std::unique_ptr<MTLCompiledComputePipeline>> pipelines_cs_;
+  std::unordered_map<SettingsComputeShader, std::unique_ptr<MTLCompiledComputePipeline>, SettingsComputeShaderHash>
+      pipelines_cs_;
   std::unordered_set<ThreadpoolWork *> warm_pending_cs_;
   mullion::mutex mutex_cs_;
 
@@ -245,6 +278,59 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
   std::once_flag eager_once_;
   std::atomic<bool> eager_stop_ = false;
   mullion::thread eager_;
+  // SC6 fork: guards eager_ and the fields below, which a reload of sc6-optimizations.ini changes on its watcher thread
+  std::mutex eager_mutex_;
+  // whether the device is complete (the first shader or pipeline request), so that eager warm-up may start
+  bool eager_allowed_ = false;
+  // whether WideWarmUpThreads's limit is in force
+  bool wide_applied_ = false;
+  int toggle_listener_ = 0;
+
+  bool EagerWanted() {
+    return Sc6ToggleValue(Sc6Toggle::EagerWarmUp)
+        .value_or(Config::getInstance().getOption<bool>("d3d11.pipelineEagerWarmUp", true));
+  }
+
+  /* SC6 fork: WideWarmUpThreads, at the device's creation and after each reload. Off restores the scheduler's own
+     limit, a quarter of the cores (task_scheduler's constructor). */
+  void ApplyWideWarmUp(bool first) {
+    bool wide = Sc6ToggleValue(Sc6Toggle::WideWarmUpThreads).value_or(true) && archive_;
+    if (!first && wide == wide_applied_)
+      return;
+    wide_applied_ = wide;
+    if (wide) {
+      int n = Config::getInstance().getOption<int>("d3d11.pipelineWarmUpThreads", 0);
+      if (n <= 0)
+        n = std::max<int>(1, (int)mullion::thread::hardware_concurrency() - 2);
+      scheduler_.set_max_low_running(n);
+      Sc6WatchLog(Sc6Toggle::WideWarmUpThreads, str::format("on: at most ", n, " warm-up compiles at once"));
+    } else {
+      if (!first)
+        scheduler_.set_max_low_running(std::max(1u, mullion::thread::hardware_concurrency() / 4));
+      Sc6WatchLog(Sc6Toggle::WideWarmUpThreads, "off: the scheduler's own limit for warm-up compiles");
+    }
+  }
+
+  /* SC6 fork: after a reload of sc6-optimizations.ini. EagerWarmUp turned off stops the warm-up thread after the
+     shader it creates; turned on, it starts the thread again, which skips the shaders that exist. */
+  void OnTogglesChanged() {
+    std::lock_guard<std::mutex> lock(eager_mutex_);
+    ApplyWideWarmUp(false);
+    if (!eager_allowed_)
+      return;
+    bool eager = EagerWanted();
+    bool running = eager_.joinable() && !eager_stop_.load();
+    if (!eager && running) {
+      eager_stop_.store(true);
+      Sc6WatchLog(Sc6Toggle::EagerWarmUp, "turned off: the warm-up thread stops");
+    } else if (eager && !running) {
+      if (eager_.joinable())
+        eager_.join();
+      eager_stop_.store(false);
+      Sc6WatchLog(Sc6Toggle::EagerWarmUp, "turned on: the warm-up thread starts");
+      RunEagerWarmUp();
+    }
+  }
 
   /**
   SC6 fork: create every stored shader that a recorded pipeline waits for, on a thread of its own. Each created
@@ -253,12 +339,18 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
   find these shaders by hash. Runs once, at the first shader or pipeline request, when the device is complete.
    */
   void StartEagerWarmUp() {
+    std::lock_guard<std::mutex> lock(eager_mutex_);
+    eager_allowed_ = archive_ != nullptr;
     // SC6 fork: sc6-optimizations.ini's EagerWarmUp decides in place of the option
-    bool eager = Sc6ToggleValue(Sc6Toggle::EagerWarmUp)
-                     .value_or(Config::getInstance().getOption<bool>("d3d11.pipelineEagerWarmUp", true));
+    bool eager = EagerWanted();
     Sc6WatchLog(Sc6Toggle::EagerWarmUp, eager ? "on" : "off");
     if (!archive_ || !eager)
       return;
+    RunEagerWarmUp();
+  }
+
+  // starts eager_; the caller holds eager_mutex_
+  void RunEagerWarmUp() {
     eager_ = mullion::thread([this]() {
       env::setThreadName("mullion-pso-prewarm");
       auto start = std::chrono::steady_clock::now();
@@ -294,7 +386,8 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
         if (queued && done >= queued)
           break;
       }
-      Sc6WatchLog(Sc6Toggle::EagerWarmUp, "every queued pipeline is done");
+      Sc6WatchLog(Sc6Toggle::EagerWarmUp, eager_stop_.load() ? "the warm-up thread stopped"
+                                                            : "every queued pipeline is done");
     });
   }
 
@@ -639,6 +732,8 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
   bool GetGraphicsPipelineImpl(MTL_GRAPHICS_PIPELINE_DESC *pDesc,
                                MTLCompiledGraphicsPipeline **ppPipeline, bool WarmUp) {
     std::lock_guard<mullion::mutex> lock(mutex_);
+    // SC6 fork: the pipeline under the sc6-optimizations.ini settings in force (d3d11_sc6_paths.hpp)
+    pDesc->SettingsKey = Sc6SettingsKey();
 
     if (auto iter = pipelines_.find(*pDesc); iter != pipelines_.end()) {
       *ppPipeline = iter->second.get();
@@ -683,6 +778,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
   bool GetGeometryPipelineImpl(MTL_GRAPHICS_PIPELINE_DESC *pDesc, MTLCompiledGeometryPipeline **ppPipeline,
                                bool WarmUp) {
     std::lock_guard<mullion::mutex> lock(mutex_gs_);
+    pDesc->SettingsKey = Sc6SettingsKey();
 
     if (auto iter = pipelines_gs_.find(*pDesc); iter != pipelines_gs_.end()) {
       *ppPipeline = iter->second.get();
@@ -712,6 +808,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
                                    MTLCompiledTessellationMeshPipeline *
                                        *ppPipeline) override {
     std::lock_guard<mullion::mutex> lock(mutex_ts_);
+    pDesc->SettingsKey = Sc6SettingsKey();
 
     if (auto iter = pipelines_ts_.find(*pDesc); iter != pipelines_ts_.end()) {
       *ppPipeline = iter->second.get();
@@ -742,7 +839,8 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
                               MTLCompiledComputePipeline **ppPipeline, bool WarmUp) {
     std::lock_guard<mullion::mutex> lock(mutex_cs_);
 
-    if (auto iter = pipelines_cs_.find(pDesc->ComputeShader); iter != pipelines_cs_.end()) {
+    SettingsComputeShader key{Sc6SettingsKey(), pDesc->ComputeShader};
+    if (auto iter = pipelines_cs_.find(key); iter != pipelines_cs_.end()) {
       *ppPipeline = iter->second.get();
       if (!WarmUp && !warm_pending_cs_.empty() && warm_pending_cs_.erase(iter->second.get()) &&
           !iter->second->GetIsDone())
@@ -750,7 +848,7 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
       return false;
     }
     auto [iter, inserted] = pipelines_cs_.insert(
-        {pDesc->ComputeShader, CreateComputePipeline(device, pDesc->ComputeShader, archive_.get(), WarmUp)});
+        {key, CreateComputePipeline(device, pDesc->ComputeShader, archive_.get(), WarmUp)});
     if (!inserted) {
       D3D11_ASSERT(0 && "duplicated compute pipeline");
     } else if (WarmUp) {
@@ -773,22 +871,20 @@ public:
     // SC6 fork: warm-up compiles may use all but 2 cores (d3d11.pipelineWarmUpThreads; 0 = that default). They
     // run only while no compile that the game waits for is queued.
     // sc6-optimizations.ini's WideWarmUpThreads = false keeps the scheduler's own limit
-    bool wide = Sc6ToggleValue(Sc6Toggle::WideWarmUpThreads).value_or(true);
-    if (archive_ && wide) {
-      int n = Config::getInstance().getOption<int>("d3d11.pipelineWarmUpThreads", 0);
-      if (n <= 0)
-        n = std::max<int>(1, (int)mullion::thread::hardware_concurrency() - 2);
-      scheduler_.set_max_low_running(n);
-      Sc6WatchLog(Sc6Toggle::WideWarmUpThreads, str::format("on: at most ", n, " warm-up compiles at once"));
-    } else {
-      Sc6WatchLog(Sc6Toggle::WideWarmUpThreads, "off: the scheduler's own limit for warm-up compiles");
+    {
+      std::lock_guard<std::mutex> lock(eager_mutex_);
+      ApplyWideWarmUp(true);
     }
+    toggle_listener_ = Sc6AddToggleListener([this]() { OnTogglesChanged(); });
     Sc6WatchLog(Sc6Toggle::PostProcessingOff, str::format(
         "sc6-optimizations.ini says ", Sc6ToggleValue(Sc6Toggle::PostProcessingOff).value_or(true) ? "on" : "off",
         "; the SC6-VRR scripts apply it to Engine.ini while the game is closed"));
   }
 
   ~PipelineCache() {
+    // waits for a reload that runs OnTogglesChanged, so none starts the warm-up thread after this
+    Sc6RemoveToggleListener(toggle_listener_);
+    std::lock_guard<std::mutex> lock(eager_mutex_);
     eager_stop_.store(true);
     if (eager_.joinable())
       eager_.join();

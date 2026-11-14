@@ -9,7 +9,9 @@ namespace mullion {
  *   - the config option `mullion.disable`, a comma-separated list of path names, or `all`,
  *   - the environment variable MULLION_SC6_DISABLE (or DXMT_SC6_DISABLE), the same kind of list.
  * The converter paths reach winemetal.so as SM50_SHADER_FLAG_SKIP_* bits, which are in the shader cache's key, so a
- * shader converted with a path off is never mistaken for one converted with it on. Both are read once per process. */
+ * shader converted with a path off is never mistaken for one converted with it on. The option and the lists are read
+ * once per process; sc6-optimizations.ini's toggles (d3d11_sc6_toggles.hpp) decide in place of the option, and follow
+ * the file while the game runs. */
 enum class Sc6Path : unsigned {
   /* rows past a constant buffer's size read zeros (D3D11.3 7.5) */
   CbufferBounds,
@@ -60,6 +62,16 @@ bool Sc6PathEnabled(Sc6Path path);
 
 /* the SM50_SHADER_FLAG_SKIP_* bits of the converter paths that are off */
 SM50_SHADER_FLAG Sc6SkipShaderFlags();
+
+/* SC6 fork: the paths that change what a pipeline compiles to, as one number: the skip flags, and bit 32 for packed
+ * varyings. Pipelines (MTL_GRAPHICS_PIPELINE_DESC's SettingsKey) and shader variants are looked up with it, so a
+ * reload of sc6-optimizations.ini compiles new ones, and a reload back to earlier values finds the earlier ones. */
+uint64_t Sc6SettingsKey();
+/* whether pipelines of the key pack their varyings (SplitVaryings off) */
+bool Sc6SettingsKeyPacksVaryings(uint64_t key);
+
+/* reads sc6-optimizations.ini's toggles again; the toggle file's watcher calls it after each reload */
+void Sc6RecomputePaths();
 
 /* SC6 fork: Mullion's converter adds two emulations to every texture sample: a border color Metal lacks, and a minimum
  * or maximum filter where Metal's sampler cannot reduce. D3D12 leaves each out of its shaders until a sampler needs it

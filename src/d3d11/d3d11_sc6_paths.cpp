@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <string>
 
 namespace mullion {
@@ -53,60 +54,114 @@ ListNames(const std::string &list, const std::string &name) {
   return false;
 }
 
-static const std::array<bool, size_t(Sc6Path::Count)> &
-EnabledPaths() {
-  static std::array<bool, size_t(Sc6Path::Count)> enabled;
+static constexpr size_t kPathCount = size_t(Sc6Path::Count);
+
+// what the config option and the lists say, which stays the same for the process
+struct PathBase {
+  std::array<bool, kPathCount> option_on;
+  std::array<bool, kPathCount> listed_off;
+  bool gs_layered_env_off;
+};
+
+static const PathBase &
+Base() {
+  static PathBase base;
   static std::once_flag once;
   std::call_once(once, [] {
     auto &config = Config::getInstance();
     auto config_list = config.getOption<std::string>("mullion.disable", "");
     auto env_list = env::getEnvVar("MULLION_SC6_DISABLE");
-    std::string off;
     for (size_t i = 0; i < kPaths.size(); i++) {
-      auto &path = kPaths[i];
-      // sc6-optimizations.ini's toggle, where it names the path's, decides in place of the config option; the lists
-      // still turn a path off
-      std::optional<bool> optimization;
-      switch (Sc6Path(i)) {
-      case Sc6Path::CbufferDwords: optimization = Sc6ToggleValue(Sc6Toggle::WholeRowConstantLoads); break;
-      case Sc6Path::SplitVaryings: optimization = Sc6ToggleValue(Sc6Toggle::PackedVaryings); break;
-      case Sc6Path::UnboundDrop: optimization = Sc6ToggleValue(Sc6Toggle::SkipUnboundSelect); break;
-      case Sc6Path::HoistLoads: optimization = Sc6ToggleValue(Sc6Toggle::SkipHoistLoads); break;
-      case Sc6Path::BoundsGuard: optimization = Sc6ToggleValue(Sc6Toggle::SkipBoundsGuard); break;
-      case Sc6Path::CbufferBounds:
-      case Sc6Path::AnisoGradients:
-        optimization = Sc6ToggleValue(Sc6Toggle::SkipCbufferBoundsAndLodGradients);
-        break;
-      default: break;
-      }
-      enabled[i] = (optimization ? !*optimization : config.getOption<bool>(path.option, true)) &&
-                   !ListNames(config_list, path.name) && !ListNames(env_list, path.name);
-      if (!enabled[i])
-        off += off.empty() ? path.name : std::string(", ") + path.name;
+      base.option_on[i] = config.getOption<bool>(kPaths[i].option, true);
+      base.listed_off[i] = ListNames(config_list, kPaths[i].name) || ListNames(env_list, kPaths[i].name);
     }
     // the older switch for the layered geometry shader path keeps working
-    if (env::getEnvVar("MULLION_SC6_GS_LAYERED") == "0" && enabled[size_t(Sc6Path::GSLayered)]) {
-      enabled[size_t(Sc6Path::GSLayered)] = false;
-      off += off.empty() ? "gs-layered" : ", gs-layered";
-    }
-    if (!off.empty())
-      WARN("SC6 paths turned off: ", off);
+    base.gs_layered_env_off = env::getEnvVar("MULLION_SC6_GS_LAYERED") == "0";
   });
-  return enabled;
+  return base;
+}
+
+// sc6-optimizations.ini's toggle for the path, which decides in place of the config option; the lists still turn a
+// path off
+static std::optional<bool>
+Optimization(Sc6Path path) {
+  switch (path) {
+  case Sc6Path::CbufferDwords: return Sc6ToggleValue(Sc6Toggle::WholeRowConstantLoads);
+  case Sc6Path::SplitVaryings: return Sc6ToggleValue(Sc6Toggle::PackedVaryings);
+  case Sc6Path::UnboundDrop: return Sc6ToggleValue(Sc6Toggle::SkipUnboundSelect);
+  case Sc6Path::HoistLoads: return Sc6ToggleValue(Sc6Toggle::SkipHoistLoads);
+  case Sc6Path::BoundsGuard: return Sc6ToggleValue(Sc6Toggle::SkipBoundsGuard);
+  case Sc6Path::CbufferBounds:
+  case Sc6Path::AnisoGradients: return Sc6ToggleValue(Sc6Toggle::SkipCbufferBoundsAndLodGradients);
+  default: return {};
+  }
+}
+
+/* the values in force. The toggle file's watcher thread replaces them (Sc6RecomputePaths) while other threads read
+   them, so each is an atomic. */
+static std::array<std::atomic<bool>, kPathCount> g_enabled{};
+static std::atomic<uint32_t> g_skip_flags = 0;
+static std::atomic<uint64_t> g_settings_key = 0;
+static std::mutex g_compute_mutex;
+static std::string g_off;
+
+static void
+Compute(bool first) {
+  std::lock_guard<std::mutex> lock(g_compute_mutex);
+  auto &base = Base();
+  std::string off;
+  uint32_t flags = 0;
+  for (size_t i = 0; i < kPaths.size(); i++) {
+    auto optimization = Optimization(Sc6Path(i));
+    bool enabled = (optimization ? !*optimization : base.option_on[i]) && !base.listed_off[i];
+    if (Sc6Path(i) == Sc6Path::GSLayered && base.gs_layered_env_off)
+      enabled = false;
+    g_enabled[i].store(enabled);
+    if (!enabled) {
+      flags |= kPaths[i].skip_flag;
+      off += off.empty() ? kPaths[i].name : std::string(", ") + kPaths[i].name;
+    }
+  }
+  g_skip_flags.store(flags);
+  g_settings_key.store(uint64_t(flags) | (uint64_t(!g_enabled[size_t(Sc6Path::SplitVaryings)].load()) << 32));
+  if (first ? !off.empty() : off != g_off)
+    WARN(first ? "SC6 paths turned off: " : "SC6 paths turned off after the reload: ", off.empty() ? "none" : off);
+  g_off = off;
+}
+
+static void
+Init() {
+  static std::once_flag once;
+  std::call_once(once, [] { Compute(true); });
+}
+
+void
+Sc6RecomputePaths() {
+  Init();
+  Compute(false);
 }
 
 bool
 Sc6PathEnabled(Sc6Path path) {
-  return EnabledPaths()[size_t(path)];
+  Init();
+  return g_enabled[size_t(path)].load(std::memory_order_relaxed);
 }
 
 SM50_SHADER_FLAG
 Sc6SkipShaderFlags() {
-  uint32_t flags = 0;
-  for (size_t i = 0; i < kPaths.size(); i++)
-    if (!EnabledPaths()[i])
-      flags |= kPaths[i].skip_flag;
-  return SM50_SHADER_FLAG(flags);
+  Init();
+  return SM50_SHADER_FLAG(g_skip_flags.load(std::memory_order_relaxed));
+}
+
+uint64_t
+Sc6SettingsKey() {
+  Init();
+  return g_settings_key.load(std::memory_order_relaxed);
+}
+
+bool
+Sc6SettingsKeyPacksVaryings(uint64_t key) {
+  return (key >> 32) & 1;
 }
 
 static std::atomic<bool> g_minmax_emulation_needed{false};

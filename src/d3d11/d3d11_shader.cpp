@@ -21,13 +21,12 @@ getGlobalShaderFlag(MTLD3D11Device *pDevice) {
       shader_flag |= SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
     if (Config::getInstance().getOption<bool>("d3d11.defuseFma", false))
       shader_flag |= SM50_SHADER_FLAG_DEFUSE_FMA;
-    // SC6 fork: the converter paths turned off (d3d11_sc6_paths.hpp); every variant hashes these flags
-    shader_flag |= Sc6SkipShaderFlags();
     if (!Sc6PathEnabled(Sc6Path::GroupSyncFence))
       shader_flag = SM50_SHADER_FLAG(shader_flag & ~SM50_SHADER_FLAG_COHERENT_GROUP_SYNC);
   });
-  // SC6 fork: read on every call, because the filter emulation turns on when a sampler first needs it
-  return SM50_SHADER_FLAG(shader_flag | SamplerEmulationsLeftOut());
+  // SC6 fork: read on every call, because the filter emulation turns on when a sampler first needs it, and the
+  // converter paths turned off (d3d11_sc6_paths.hpp) follow sc6-optimizations.ini; every variant hashes these flags
+  return SM50_SHADER_FLAG(shader_flag | Sc6SkipShaderFlags() | SamplerEmulationsLeftOut());
 };
 
 template <typename Proc>
