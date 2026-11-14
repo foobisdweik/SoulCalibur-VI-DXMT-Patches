@@ -1,0 +1,534 @@
+#include "d3d11_shader.hpp"
+#include "Metal.hpp"
+#include "airconv_public.h"
+#include "config/config.hpp"
+#include "mullion_info.hpp"
+#include "d3d11_sc6_paths.hpp"
+#include "d3d11_sc6_toggles.hpp"
+#include "d3d11_input_layout.hpp"
+#include "sha1/sha1_util.hpp"
+#include <mutex>
+
+namespace mullion {
+
+SM50_SHADER_FLAG
+getGlobalShaderFlag(MTLD3D11Device *pDevice) {
+  static SM50_SHADER_FLAG shader_flag;
+  static std::once_flag get_shader_flag_once;
+  std::call_once(get_shader_flag_once, [=]() {
+    shader_flag = GPUShaderFlags(pDevice->GetMullionDevice().device());
+    if (Config::getInstance().getOption<bool>("d3d11.sampleNaNToZero", false))
+      shader_flag |= SM50_SHADER_FLAG_SAMPLE_NAN_TO_ZERO;
+    if (Config::getInstance().getOption<bool>("d3d11.defuseFma", false))
+      shader_flag |= SM50_SHADER_FLAG_DEFUSE_FMA;
+    if (!Sc6PathEnabled(Sc6Path::GroupSyncFence))
+      shader_flag = SM50_SHADER_FLAG(shader_flag & ~SM50_SHADER_FLAG_COHERENT_GROUP_SYNC);
+  });
+  // SC6 fork: read on every call, because the filter emulation turns on when a sampler first needs it, and the
+  // converter paths turned off (d3d11_sc6_paths.hpp) follow sc6-optimizations.ini; every variant hashes these flags
+  return SM50_SHADER_FLAG(shader_flag | Sc6SkipShaderFlags() | SamplerEmulationsLeftOut());
+};
+
+template <typename Proc>
+class GeneralShaderCompileTask : public CompiledShader {
+public:
+  GeneralShaderCompileTask(MTLD3D11Device *pDevice, ManagedShader shader,
+                           Proc &&proc, std::string func_name, const Sha1Digest& variant_digest)
+      : CompiledShader(), proc(std::forward<Proc>(proc)), func_name(func_name), device_(pDevice),
+        shader_(shader), variant_digest_(variant_digest) {
+    sm50_common.type = SM50_SHADER_COMMON;
+    sm50_common.metal_version = (SM50_SHADER_METAL_VERSION)pDevice->GetMullionDevice().metalVersion();
+    sm50_common.flags = getGlobalShaderFlag(pDevice);
+    sm50_common.simd_width = 0; // DXBC has no wave operations
+    sm50_common.next = nullptr;
+  }
+
+  ~GeneralShaderCompileTask() {}
+
+  bool GetShader(MTL_COMPILED_SHADER *pShaderData) final {
+    bool ret = false;
+    if ((ret = ready_.load(std::memory_order_acquire))) {
+      *pShaderData = {function_};
+    }
+    return ret;
+  }
+
+  ThreadpoolWork *
+  RunThreadpoolWork() {
+    auto pool = WMT::MakeAutoreleasePool();
+    WMT::Reference<WMT::Error> err;
+    WMT::Reference<WMT::DispatchData> lib_data = shader_->find_cached_variant(variant_digest_);
+
+    while (lib_data != nullptr) {
+      auto library = device_->GetMTLDevice().newLibrary(lib_data, err);
+
+      if (err || !library) {
+        ERR("Failed to create MTLLibrary from cache: ", err.description().getUTF8String());
+        lib_data = nullptr;
+        break;
+      }
+
+      function_ = library.newFunction(func_name.c_str());
+
+      if (function_ == nullptr) {
+        ERR("Failed to create MTLFunction from cache: ", func_name);
+        lib_data = nullptr;
+        break;
+      }
+      break;
+    }
+
+    if (!lib_data) {
+      SM50_COMPILED_BITCODE bitcode;
+      sm50_bitcode_t compile_result = proc(func_name.c_str(), &sm50_common);
+
+      if (!compile_result)
+        return this;
+
+      SM50GetCompiledBitcode(compile_result, &bitcode);
+      lib_data = WMT::MakeDispatchData(bitcode.Data, bitcode.Size);
+      auto library = device_->GetMTLDevice().newLibrary(lib_data, err);
+
+      if (err) {
+        ERR("Failed to create MTLLibrary: ", err.description().getUTF8String());
+        shader_->dump();
+        return this;
+      }
+
+      shader_->update_cached_variant(variant_digest_, lib_data);
+
+      SM50DestroyBitcode(compile_result);
+      function_ = library.newFunction(func_name.c_str());
+
+      if (function_ == nullptr) {
+        ERR("Failed to create MTLFunction: ", func_name);
+        shader_->dump();
+      }
+    }
+    // SC6 fork: sc6-optimizations.ini's Watch* lines for the converter toggles
+    Sc6WatchConvertedShader(sm50_common.flags, func_name);
+
+    return this;
+  }
+
+  bool GetIsDone() { return ready_; }
+
+  void SetIsDone(bool state) { ready_.store(state); }
+
+private:
+  SM50_SHADER_COMMON_DATA sm50_common;
+  Proc proc;
+  std::string func_name;
+  MTLD3D11Device *device_;
+  ManagedShader shader_;
+  Sha1Digest variant_digest_;
+  std::atomic_bool ready_;
+  WMT::Reference<WMT::Function> function_;
+};
+
+template <>
+std::unique_ptr<CompiledShader>
+CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+                    ShaderVariantVertex variant) {
+  Sha1HashState h;
+  h.update(getGlobalShaderFlag(pDevice));
+  h.update(variant.gs_passthrough);
+  h.update(variant.rasterization_disabled);
+  h.update(variant.clip_distance_varyings);
+  h.update(variant.packed_varyings);
+  if (variant.input_layout_handle)
+    h.update(variant.input_layout_handle->sha1());
+  auto variant_digest = h.final();
+  std::string func_name = "vs_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
+
+  auto proc = [=](const char *func_name, SM50_SHADER_COMMON_DATA *common) -> sm50_bitcode_t  {
+    SM50_SHADER_IA_INPUT_LAYOUT_DATA data_ia_layout;
+    SM50_SHADER_GS_PASS_THROUGH_DATA data_gs_passthrough;
+    data_gs_passthrough.type = SM50_SHADER_GS_PASS_THROUGH;
+    data_gs_passthrough.DataEncoded = variant.gs_passthrough;
+    data_gs_passthrough.RasterizationDisabled = variant.rasterization_disabled;
+    data_gs_passthrough.ClipDistanceVaryings = variant.clip_distance_varyings;
+    data_gs_passthrough.CullDistanceVaryings = false;
+    data_gs_passthrough.PackedVaryings = variant.packed_varyings;
+    data_gs_passthrough.next = common;
+    if (variant.input_layout_handle) {
+      data_gs_passthrough.next = &data_ia_layout;
+      data_ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
+      data_ia_layout.next = common;
+      data_ia_layout.slot_mask = variant.input_layout_handle->input_slot_mask();
+      data_ia_layout
+          .num_elements = variant.input_layout_handle->input_layout_element(
+          (MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC **)&data_ia_layout.elements);
+    }
+
+    sm50_bitcode_t compile_result = nullptr;
+    sm50_error_t sm50_err = nullptr;
+    if (SM50Compile(
+            shader->handle(),
+            (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data_gs_passthrough,
+            func_name, &compile_result, &sm50_err)) {
+      ERR("Failed to compile shader: ", SM50GetErrorMessageString(sm50_err));
+      SM50FreeError(sm50_err);
+      return nullptr;
+    }
+    return compile_result;
+  };
+  return std::make_unique<GeneralShaderCompileTask<decltype(proc)>>(
+      pDevice, shader, std::move(proc), func_name, variant_digest);
+};
+
+template <>
+std::unique_ptr<CompiledShader>
+CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+                    ShaderVariantPixel variant) {
+  Sha1HashState h;
+  h.update(getGlobalShaderFlag(pDevice));
+  h.update(variant.sample_mask);
+  h.update(variant.unorm_output_reg_mask);
+  h.update(variant.dual_source_blending);
+  h.update(variant.disable_depth_output);
+  h.update(variant.pixel_formats);
+  h.update(variant.pipeline_statistics);
+  h.update(variant.alpha_to_coverage);
+  h.update(variant.centered_samples);
+  h.update(variant.single_raster_sample);
+  h.update(variant.paired_samples);
+  h.update(variant.clip_distances);
+  h.update(variant.blend);
+  h.update(variant.packed_varyings);
+  auto variant_digest = h.final();
+  std::string func_name = "ps_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
+
+  auto proc = [=](const char *func_name, SM50_SHADER_COMMON_DATA *common) -> sm50_bitcode_t  {
+    SM50_SHADER_PSO_PIXEL_SHADER_DATA data{};
+    data.type = SM50_SHADER_PSO_PIXEL_SHADER;
+    data.next = common;
+    data.sample_mask = variant.sample_mask;
+    data.dual_source_blending = variant.dual_source_blending;
+    data.disable_depth_output = variant.disable_depth_output;
+    data.unorm_output_reg_mask = variant.unorm_output_reg_mask;
+    std::copy(variant.pixel_formats.begin(), variant.pixel_formats.end(), data.pixel_formats);
+    data.pipeline_statistics = variant.pipeline_statistics;
+    data.alpha_to_coverage = variant.alpha_to_coverage;
+    data.centered_samples = variant.centered_samples;
+    data.single_raster_sample = variant.single_raster_sample;
+    data.paired_samples = variant.paired_samples;
+    data.clip_distances = variant.clip_distances;
+    data.cull_distances = 0;
+    data.cull_depth = false;
+    std::copy(variant.blend.begin(), variant.blend.end(), data.blend);
+    data.depth_bounds = false;
+    data.late_tests = false;
+    data.conservative = false;
+    data.conservative_hull = false;
+    data.coarse_shading = false;
+    data.shading_rate_varying = 0;
+    data.quad_lines = false;
+    data.packed_varyings = variant.packed_varyings;
+
+    sm50_bitcode_t compile_result = nullptr;
+    sm50_error_t sm50_err = nullptr;
+    if (SM50Compile(shader->handle(),
+                               (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&data,
+                               func_name, &compile_result, &sm50_err)) {
+      ERR("Failed to compile shader: ", SM50GetErrorMessageString(sm50_err));
+      SM50FreeError(sm50_err);
+      return nullptr;
+    }
+    return compile_result;
+  };
+  return std::make_unique<GeneralShaderCompileTask<decltype(proc)>>(
+      pDevice, shader, std::move(proc), func_name, variant_digest);
+};
+
+template <>
+std::unique_ptr<CompiledShader>
+CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+                    ShaderVariantDefault) {
+  Sha1HashState h;
+  h.update(getGlobalShaderFlag(pDevice));
+  auto variant_digest = h.final();
+  std::string func_name = "cs_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
+  auto proc = [=](const char *func_name, SM50_SHADER_COMMON_DATA *common) -> sm50_bitcode_t  {
+    sm50_bitcode_t compile_result = nullptr;
+    sm50_error_t sm50_err = nullptr;
+    if (SM50Compile(shader->handle(), (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)common, func_name,
+                               &compile_result, &sm50_err)) {
+      ERR("Failed to compile shader: ", SM50GetErrorMessageString(sm50_err));
+      SM50FreeError(sm50_err);
+      return nullptr;
+    }
+    return compile_result;
+  };
+  return std::make_unique<GeneralShaderCompileTask<decltype(proc)>>(
+      pDevice, shader, std::move(proc), func_name, variant_digest);
+};
+
+template <>
+std::unique_ptr<CompiledShader>
+CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+                    ShaderVariantTessellationVertexHull variant) {
+  Sha1HashState h;
+  h.update(getGlobalShaderFlag(pDevice));
+  h.update(variant.vertex_shader_handle->sha1());
+  h.update(variant.index_buffer_format);
+  h.update(variant.max_potential_tess_factor);
+  h.update(variant.mesh_vertex_size);
+  if (variant.input_layout_handle)
+    h.update(variant.input_layout_handle->sha1());
+  h.update(variant.max_mesh_threadgroups);
+  if (variant.geometry_shader_handle)
+    h.update(variant.geometry_shader_handle->sha1());
+  auto variant_digest = h.final();
+  std::string func_name = "vshs_" + shader->sha1().string().substr(0, 8) + "_" +  variant_digest.string();
+  auto proc = [=](const char *func_name, SM50_SHADER_COMMON_DATA *common) -> sm50_bitcode_t  {
+    SM50_SHADER_IA_INPUT_LAYOUT_DATA ia_layout;
+    SM50_SHADER_PSO_TESSELLATOR_DATA pso_tess{};
+    ia_layout.index_buffer_format = variant.index_buffer_format;
+    if (variant.input_layout_handle) {
+      ia_layout.slot_mask = variant.input_layout_handle->input_slot_mask();
+      ia_layout.num_elements = variant.input_layout_handle->input_layout_element(
+          reinterpret_cast<MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC **>(&ia_layout.elements)
+      );
+    } else {
+      ia_layout.slot_mask = 0;
+      ia_layout.num_elements = 0;
+    }
+    ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
+    ia_layout.next = &pso_tess;
+    pso_tess.type = SM50_SHADER_PSO_TESSELLATOR;
+    pso_tess.next = common;
+    pso_tess.max_potential_tess_factor = variant.max_potential_tess_factor;
+    pso_tess.mesh_vertex_size = variant.mesh_vertex_size;
+    pso_tess.max_mesh_threadgroups = variant.max_mesh_threadgroups;
+    if (variant.geometry_shader_handle)
+      pso_tess.geometry = variant.geometry_shader_handle->handle();
+
+    sm50_bitcode_t compile_result = nullptr;
+    sm50_error_t sm50_err = nullptr;
+    if (SM50CompileTessellationPipelineHull(
+            variant.vertex_shader_handle->handle(), shader->handle(), 
+            (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&ia_layout, func_name,
+            &compile_result, &sm50_err)) {
+      ERR("Failed to compile shader: ", SM50GetErrorMessageString(sm50_err));
+      SM50FreeError(sm50_err);
+      return nullptr;
+    }
+    return compile_result;
+  };
+  return std::make_unique<GeneralShaderCompileTask<decltype(proc)>>(
+      pDevice, shader, std::move(proc), func_name, variant_digest);
+}
+
+template <>
+std::unique_ptr<CompiledShader>
+CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+                    ShaderVariantTessellationDomain variant) {
+  Sha1HashState h;
+  h.update(getGlobalShaderFlag(pDevice));
+  h.update(variant.hull_shader_handle->sha1());
+  h.update(variant.rasterization_disabled);
+  h.update(variant.max_potential_tess_factor);
+  h.update(variant.mesh_vertex_size);
+  h.update(variant.max_mesh_threadgroups);
+  h.update(variant.clip_distance_varyings);
+  if (variant.geometry_shader_handle)
+    h.update(variant.geometry_shader_handle->sha1());
+  auto variant_digest = h.final();
+  std::string func_name = "ds_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
+  auto proc = [=](const char *func_name, SM50_SHADER_COMMON_DATA *common) -> sm50_bitcode_t  {
+    // of this the domain stage takes only whether it rasterizes, and where its clip distances go
+    SM50_SHADER_GS_PASS_THROUGH_DATA gs_passthrough{};
+    SM50_SHADER_PSO_TESSELLATOR_DATA pso_tess{};
+    gs_passthrough.type = SM50_SHADER_GS_PASS_THROUGH;
+    gs_passthrough.RasterizationDisabled = variant.rasterization_disabled;
+    gs_passthrough.ClipDistanceVaryings = variant.clip_distance_varyings;
+    gs_passthrough.next = &pso_tess;
+    pso_tess.type = SM50_SHADER_PSO_TESSELLATOR;
+    pso_tess.next = common;
+    pso_tess.max_potential_tess_factor = variant.max_potential_tess_factor;
+    pso_tess.mesh_vertex_size = variant.mesh_vertex_size;
+    pso_tess.max_mesh_threadgroups = variant.max_mesh_threadgroups;
+    if (variant.geometry_shader_handle)
+      pso_tess.geometry = variant.geometry_shader_handle->handle();
+
+    sm50_bitcode_t compile_result = nullptr;
+    sm50_error_t sm50_err = nullptr;
+    if (SM50CompileTessellationPipelineDomain(
+            variant.hull_shader_handle->handle(), shader->handle(),
+            (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&gs_passthrough, func_name,
+            &compile_result, &sm50_err)) {
+      ERR("Failed to compile shader: ", SM50GetErrorMessageString(sm50_err));
+      SM50FreeError(sm50_err);
+      return nullptr;
+    }
+    return compile_result;
+  };
+  return std::make_unique<GeneralShaderCompileTask<decltype(proc)>>(
+      pDevice, shader, std::move(proc), func_name, variant_digest);
+}
+
+// stream output's compilation argument, in front of `next`
+static void *
+stream_output_argument(const ShaderVariantStreamOutput &variant, SM50_SHADER_STREAM_OUTPUT_DATA &data, void *next) {
+  if (!variant.layout)
+    return next;
+  data = {};
+  data.type = SM50_SHADER_STREAM_OUTPUT;
+  data.next = next;
+  data.num_elements = variant.layout->GetStreamOutputElements(&data.elements, data.strides);
+  data.rasterized_stream = variant.layout->RasterizedStream();
+  data.counting = variant.counting;
+  return &data;
+}
+
+static void
+hash_stream_output(Sha1HashState &h, const ShaderVariantStreamOutput &variant) {
+  h.update(variant.input_primitive);
+  h.update(variant.pass_through);
+  h.update(variant.quad_lines);
+  if (!variant.layout)
+    return;
+  h.update(variant.layout->Digest());
+  h.update(variant.counting);
+}
+
+template <>
+std::unique_ptr<CompiledShader>
+CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+                    ShaderVariantGeometryVertex variant) {
+  Sha1HashState h;
+  h.update(getGlobalShaderFlag(pDevice));
+  if (variant.geometry_shader_handle)
+    h.update(variant.geometry_shader_handle->sha1());
+  h.update(variant.index_buffer_format);
+  h.update(variant.strip_topology);
+  hash_stream_output(h, variant.stream_output);
+  if (variant.input_layout_handle)
+    h.update(variant.input_layout_handle->sha1());
+  auto variant_digest = h.final();
+  std::string func_name = "vsgs_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
+  auto proc = [=](const char *func_name, SM50_SHADER_COMMON_DATA *common) -> sm50_bitcode_t  {
+    SM50_SHADER_STREAM_OUTPUT_DATA stream_output;
+    SM50_SHADER_IA_INPUT_LAYOUT_DATA ia_layout;
+    ia_layout.index_buffer_format = variant.index_buffer_format;
+    if (variant.input_layout_handle) {
+      ia_layout.slot_mask = variant.input_layout_handle->input_slot_mask();
+      ia_layout.num_elements =
+          variant.input_layout_handle->input_layout_element(
+              (MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC **)&ia_layout.elements);
+    } else {
+      ia_layout.slot_mask = 0;
+      ia_layout.num_elements = 0;
+    }
+
+    ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
+    ia_layout.next = stream_output_argument(variant.stream_output, stream_output, common);
+
+    SM50_SHADER_PSO_GEOMETRY_SHADER_DATA geometry{};
+    geometry.type = SM50_SHADER_PSO_GEOMETRY_SHADER;
+    geometry.next = &ia_layout;
+    geometry.strip_topology = variant.strip_topology;
+    geometry.input_primitive = variant.stream_output.input_primitive;
+    geometry.pass_through = variant.stream_output.pass_through;
+
+    sm50_bitcode_t compile_result = nullptr;
+    sm50_error_t sm50_err = nullptr;
+    if (SM50CompileGeometryPipelineVertex(
+            shader->handle(), variant.geometry_shader_handle ? variant.geometry_shader_handle->handle() : sm50_shader_t{},
+            (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&geometry, func_name,
+            &compile_result, &sm50_err)) {
+      ERR("Failed to compile shader: ", SM50GetErrorMessageString(sm50_err));
+      SM50FreeError(sm50_err);
+      return nullptr;
+    }
+    return compile_result;
+  };
+  return std::make_unique<GeneralShaderCompileTask<decltype(proc)>>(
+      pDevice, shader, std::move(proc), func_name, variant_digest);
+}
+
+template <>
+std::unique_ptr<CompiledShader>
+CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+                    ShaderVariantGeometryLayeredVertex variant) {
+  Sha1HashState h;
+  h.update(getGlobalShaderFlag(pDevice));
+  h.update(variant.geometry_shader_handle->sha1());
+  if (variant.input_layout_handle)
+    h.update(variant.input_layout_handle->sha1());
+  auto variant_digest = h.final();
+  std::string func_name = "vsgl_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
+  auto proc = [=](const char *func_name, SM50_SHADER_COMMON_DATA *common) -> sm50_bitcode_t  {
+    SM50_SHADER_IA_INPUT_LAYOUT_DATA ia_layout{};
+    SM50_SHADER_GS_LAYERED_DATA layered{};
+    layered.type = SM50_SHADER_GS_LAYERED;
+    layered.next = common;
+    if (variant.input_layout_handle) {
+      ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
+      ia_layout.next = common;
+      ia_layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
+      ia_layout.slot_mask = variant.input_layout_handle->input_slot_mask();
+      ia_layout.num_elements = variant.input_layout_handle->input_layout_element(
+          (MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC **)&ia_layout.elements);
+      layered.next = &ia_layout;
+    }
+
+    sm50_bitcode_t compile_result = nullptr;
+    sm50_error_t sm50_err = nullptr;
+    if (SM50CompileGeometryPipelineVertex(
+            shader->handle(), variant.geometry_shader_handle->handle(),
+            (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&layered, func_name,
+            &compile_result, &sm50_err)) {
+      ERR("Failed to compile shader: ", SM50GetErrorMessageString(sm50_err));
+      SM50FreeError(sm50_err);
+      return nullptr;
+    }
+    return compile_result;
+  };
+  return std::make_unique<GeneralShaderCompileTask<decltype(proc)>>(
+      pDevice, shader, std::move(proc), func_name, variant_digest);
+}
+
+template <>
+std::unique_ptr<CompiledShader>
+CreateVariantShader(MTLD3D11Device *pDevice, ManagedShader shader,
+                    ShaderVariantGeometry variant) {
+  Sha1HashState h;
+  h.update(getGlobalShaderFlag(pDevice));
+  h.update(variant.vertex_shader_handle->sha1());
+  h.update(variant.strip_topology);
+  hash_stream_output(h, variant.stream_output);
+  h.update(variant.pipeline_statistics);
+  h.update(variant.clip_distance_varyings);
+  auto variant_digest = h.final();
+  std::string func_name = "gs_" + shader->sha1().string().substr(0, 8) + "_" + variant_digest.string();
+  auto proc = [=](const char *func_name, SM50_SHADER_COMMON_DATA *common) -> sm50_bitcode_t  {
+    SM50_SHADER_STREAM_OUTPUT_DATA stream_output;
+    SM50_SHADER_PSO_GEOMETRY_SHADER_DATA geometry{};
+    geometry.type = SM50_SHADER_PSO_GEOMETRY_SHADER;
+    geometry.next = stream_output_argument(variant.stream_output, stream_output, common);
+    geometry.strip_topology = variant.strip_topology;
+    geometry.input_primitive = variant.stream_output.input_primitive;
+    geometry.pass_through = variant.stream_output.pass_through;
+    geometry.quad_lines = variant.stream_output.quad_lines;
+    geometry.pipeline_statistics = variant.pipeline_statistics;
+    geometry.clip_distance_varyings = variant.clip_distance_varyings;
+
+    sm50_bitcode_t compile_result = nullptr;
+    sm50_error_t sm50_err = nullptr;
+    if (SM50CompileGeometryPipelineGeometry(
+            variant.vertex_shader_handle->handle(), shader == variant.vertex_shader_handle ? sm50_shader_t{} : shader->handle(),
+            (SM50_SHADER_COMPILATION_ARGUMENT_DATA *)&geometry, func_name,
+            &compile_result, &sm50_err)) {
+      ERR("Failed to compile shader: ", SM50GetErrorMessageString(sm50_err));
+      SM50FreeError(sm50_err);
+      return nullptr;
+    }
+    return compile_result;
+  };
+  return std::make_unique<GeneralShaderCompileTask<decltype(proc)>>(
+      pDevice, shader, std::move(proc), func_name, variant_digest);
+}
+
+} // namespace mullion

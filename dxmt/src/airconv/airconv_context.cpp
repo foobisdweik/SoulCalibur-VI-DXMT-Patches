@@ -1,0 +1,258 @@
+#include <mutex>
+#include <cstdlib>
+#include <cstring>
+#include "airconv_switches.hpp"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/VersionTuple.h"
+#include "llvm/Bitcode/BitcodeReader.h"
+#include "llvm/Linker/Linker.h"
+#include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Transforms/Scalar/LowerExpectIntrinsic.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Scalar/SROA.h"
+#include "llvm/Transforms/Scalar/EarlyCSE.h"
+#include "llvm/Transforms/IPO/AlwaysInliner.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/IPO/DeadArgumentElimination.h"
+#include "llvm/Transforms/IPO/GlobalOpt.h"
+#include "llvm/Transforms/IPO/SCCP.h"
+#include "llvm/Transforms/IPO/Annotation2Metadata.h"
+#include "llvm/Transforms/IPO/ForceFunctionAttrs.h"
+#include "llvm/Transforms/IPO/InferFunctionAttrs.h"
+#include "llvm/Transforms/Utils/Mem2Reg.h"
+
+#include "airconv_context.hpp"
+
+#include "air_msad.h"
+#include "air_denorm.h"
+#include "air_samplepos.h"
+#include "air_tessellation.h"
+
+#include "transforms/guard_out_of_bounds.hpp"
+#include "transforms/lower_16bit_texread.hpp"
+#include "transforms/merge_sample_branches.hpp"
+#include "transforms/merge_minmax_branches.hpp"
+#include "transforms/simdgroup_implicit_membarrier.hpp"
+#include "transforms/hoist_loads.hpp"
+
+// dxbc_converter.hpp
+namespace mullion::dxbc {
+void FinishFeedbackLanes(llvm::Module &module);
+}
+
+using namespace llvm;
+
+namespace mullion {
+
+void initializeModule(llvm::Module &M) {
+  M.setSourceFileName("airconv_generated.metal");
+  M.setTargetTriple("air64-apple-macosx14.0.0");
+  M.setDataLayout(
+    "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:"
+    "64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-"
+    "v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:"
+    "16:32"
+  );
+  M.setSDKVersion(VersionTuple(15, 0));
+  M.addModuleFlag(Module::ModFlagBehavior::Error, "wchar_size", 4);
+  M.addModuleFlag(Module::ModFlagBehavior::Max, "frame-pointer", 2);
+  M.addModuleFlag(Module::ModFlagBehavior::Max, "air.max_device_buffers", 31);
+  M.addModuleFlag(Module::ModFlagBehavior::Max, "air.max_constant_buffers", 31);
+  M.addModuleFlag(
+    Module::ModFlagBehavior::Max, "air.max_threadgroup_buffers", 31
+  );
+  M.addModuleFlag(Module::ModFlagBehavior::Max, "air.max_textures", 128);
+  M.addModuleFlag(
+    Module::ModFlagBehavior::Max, "air.max_read_write_textures", 8
+  );
+  M.addModuleFlag(Module::ModFlagBehavior::Max, "air.max_samplers", 16);
+
+};
+
+static std::once_flag llvm_overwrite;
+
+bool
+runOptimizationPasses(llvm::Module &M, llvm::raw_ostream &Error) {
+  // a pixel shader that was not shaded coarsely keeps every lane's writes
+  mullion::dxbc::FinishFeedbackLanes(M);
+  // Metal says of ill-formed IR only "Failed to materializeAll"
+  if (verifyModule(M, &Error))
+    return false;
+
+  // once, before any compilation on any thread runs InstCombine, which reads it
+  std::call_once(llvm_overwrite, [] {
+    auto Map = cl::getRegisteredOptions();
+    auto InfiniteLoopThreshold = Map["instcombine-infinite-loop-threshold"];
+    if (InfiniteLoopThreshold) {
+      reinterpret_cast<cl::opt<unsigned> *>(InfiniteLoopThreshold)->setValue(1000);
+    }
+  });
+
+  // Following optimization passes are picked from default LLVM pipelines
+  // An unoptimized shader can make PSO compilation take a very long time
+  // But a full optimization pipeline is also too heavy
+  // So we choose some passes that really matter to run
+
+  // Create the analysis managers.
+  // These must be declared in this order so that they are destroyed in the
+  // correct order due to inter-analysis-manager references.
+  LoopAnalysisManager LAM;
+  FunctionAnalysisManager FAM;
+  CGSCCAnalysisManager CGAM;
+  ModuleAnalysisManager MAM;
+
+  // Create the new pass manager builder.
+  // Take a look at the PassBuilder constructor parameters for more
+  // customization, e.g. specifying a TargetMachine or various debugging
+  // options.
+  llvm::PassInstrumentationCallbacks PIC;
+  PassBuilder PB(nullptr, PipelineTuningOptions(), {}, &PIC);
+
+  // Register all the basic analyses with the managers.
+  PB.registerModuleAnalyses(MAM);
+  PB.registerCGSCCAnalyses(CGAM);
+  PB.registerFunctionAnalyses(FAM);
+  PB.registerLoopAnalyses(LAM);
+  PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+  // llvm::StandardInstrumentations SI(true);
+  // SI.registerCallbacks(PIC, &FAM);
+
+  ModulePassManager MPM;
+
+  // Convert @llvm.global.annotations to !annotation metadata.
+  MPM.addPass(Annotation2MetadataPass());
+
+  // Force any function attributes we want the rest of the pipeline to observe.
+  MPM.addPass(ForceFunctionAttrsPass());
+  // Do basic inference of function attributes from known properties of system
+  // libraries and other oracles.
+  MPM.addPass(InferFunctionAttrsPass());
+
+  {
+    // Create an early function pass manager to cleanup the output of the
+    // frontend.
+    FunctionPassManager EarlyFPM;
+    // Lower llvm.expect to metadata before attempting transforms.
+    // Compare/branch metadata may alter the behavior of passes like SimplifyCFG.
+    EarlyFPM.addPass(LowerExpectIntrinsicPass());
+    EarlyFPM.addPass(SimplifyCFGPass());
+    EarlyFPM.addPass(SROAPass());
+    EarlyFPM.addPass(EarlyCSEPass());
+    MPM.addPass(createModuleToFunctionPassAdaptor(std::move(EarlyFPM), true /* ? */));
+  }
+
+  MPM.addPass(AlwaysInlinerPass());
+  MPM.addPass(IPSCCPPass());
+  MPM.addPass(GlobalOptPass());
+  MPM.addPass(createModuleToFunctionPassAdaptor(PromotePass()));
+  MPM.addPass(DeadArgumentEliminationPass());
+
+  {
+    // Create a small function pass pipeline to cleanup after all the global
+    // optimizations.
+    FunctionPassManager GlobalCleanupPM;
+    // MULLION_AIRCONV_SKIP=sample-branch-merge leaves a branch per sample (SampleImplicit)
+    // SC6 fork: SM50_SHADER_FLAG_SKIP_SAMPLE_BRANCH_MERGE leaves them too (airconv_switches.hpp)
+    if (!airconv_skipped("sample-branch-merge", SM50_SHADER_FLAG_SKIP_SAMPLE_BRANCH_MERGE))
+      GlobalCleanupPM.addPass(air::MergeSampleBranchesPass());
+    else
+      GlobalCleanupPM.addPass(air::MergeSampleBranchesPass(false));
+    // MULLION_AIRCONV_SKIP=minmax-branch-merge leaves a minimum and maximum filter branch per sample (MinMaxFilter)
+    // SC6 fork: SM50_SHADER_FLAG_SKIP_MINMAX_BRANCH_MERGE leaves them too (airconv_switches.hpp)
+    GlobalCleanupPM.addPass(
+        air::MergeMinMaxBranchesPass(!airconv_skipped("minmax-branch-merge", SM50_SHADER_FLAG_SKIP_MINMAX_BRANCH_MERGE))
+    );
+    GlobalCleanupPM.addPass(InstCombinePass());
+
+    GlobalCleanupPM.addPass(SimplifyCFGPass(SimplifyCFGOptions().convertSwitchRangeToICmp(true)));
+
+    GlobalCleanupPM.addPass(air::Lower16BitTexReadPass());
+    // MULLION_AIRCONV_SKIP names what the converter leaves out, to find the one a shader goes wrong with
+    auto skip = getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP");
+    if (!skip || !strstr(skip, "simdgroup-barrier"))
+      GlobalCleanupPM.addPass(air::SimdgroupImplicitMemBarrierPass());
+    // SC6 fork: SM50_SHADER_FLAG_SKIP_BOUNDS_GUARD (or MULLION_AIRCONV_SKIP=bounds-guard) leaves the guard out
+    if (!airconv_skipped("bounds-guard", SM50_SHADER_FLAG_SKIP_BOUNDS_GUARD))
+      GlobalCleanupPM.addPass(air::GuardOutOfBoundsPass());
+    // loads move ahead of what uses them, at most 32 registers of values ahead (MULLION_AIRCONV_HOIST_LOADS, which
+    // the shader cache's key has, for another window): more, and Metal's compiler spills them
+    // SC6 fork: SM50_SHADER_FLAG_SKIP_HOIST_LOADS leaves this out too
+    if (!airconv_skipped("hoist-loads", SM50_SHADER_FLAG_SKIP_HOIST_LOADS)) {
+      auto window = getenv("MULLION_AIRCONV_HOIST_LOADS");
+      GlobalCleanupPM.addPass(air::HoistLoadsPass(window ? atoi(window) : 32));
+    }
+
+    MPM.addPass(createModuleToFunctionPassAdaptor(std::move(GlobalCleanupPM), true /* ? */));
+  }
+
+  if (auto temp = getenv("DXMT_TEMP_O2"))
+    MPM.addPass(createModuleToFunctionPassAdaptor(PB.buildFunctionSimplificationPipeline(
+        temp[0] == '3' ? OptimizationLevel::O3 : OptimizationLevel::O2, ThinOrFullLTOPhase::None
+    )));
+
+  // MPM.addPass(VerifierPass());
+
+  // Optimize the IR!
+  MPM.run(M, MAM);
+  return true;
+}
+
+void
+removeNamedMetadata(llvm::Module &M, StringRef Name) {
+  if (auto MD = M.getNamedMetadata(Name)) {
+    M.eraseNamedMetadata(MD);
+  }
+}
+
+template<size_t N>
+void linkShader(llvm::Module &M, const unsigned char (&bitcode)[N]) {
+  auto buffer = MemoryBuffer::getMemBufferCopy(StringRef((const char *)bitcode, N));
+  Expected<std::unique_ptr<Module>> modOrErr = parseBitcodeFile(buffer->getMemBufferRef(), M.getContext());
+
+  if (!modOrErr) {
+    // not expected to see this unless something really bad happened in compile time
+    errs() << "Failed to parse air bitcode\n";
+    return;
+  }
+
+  auto module = std::move(modOrErr.get());
+
+  removeNamedMetadata(*module, "air.compile_options");
+  removeNamedMetadata(*module, "air.version");
+  removeNamedMetadata(*module, "air.language_version");
+  removeNamedMetadata(*module, "air.source_file_name");
+  removeNamedMetadata(*module, "llvm.ident");
+  removeNamedMetadata(*module, "llvm.module.flags");
+
+  llvm::Linker::linkModules(M, std::move(module), Linker::LinkOnlyNeeded);
+};
+
+void
+linkMSAD(llvm::Module &M) {
+  linkShader(M, air_msad);
+}
+
+void
+linkDenorm(llvm::Module &M) {
+  linkShader(M, air_denorm);
+}
+
+void
+linkSamplePos(llvm::Module &M) {
+  linkShader(M, air_samplepos);
+}
+
+void
+linkTessellation(llvm::Module &M) {
+  linkShader(M, air_tessellation);
+}
+
+} // namespace mullion

@@ -1,0 +1,297 @@
+#include "Metal.hpp"
+#include "d3d11_private.h"
+#include "d3d11_pipeline.hpp"
+#include "d3d11_pipeline_archive.hpp"
+#include "d3d11_device.hpp"
+#include "d3d11_shader.hpp"
+#include "d3d11_sc6_paths.hpp"
+#include "d3d11_sc6_toggles.hpp"
+#include "log/log.hpp"
+#include <atomic>
+#include <chrono>
+
+namespace mullion {
+
+void
+WaitUntilPipelineReady(std::atomic_bool &ready) {
+  if (ready.load(std::memory_order_acquire))
+    return;
+  auto start = std::chrono::steady_clock::now();
+  ready.wait(false, std::memory_order_acquire);
+  PipelineArchive::NoteEncodeWait(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()
+  );
+}
+
+class MTLCompiledGraphicsPipelineImpl
+    : public MTLCompiledGraphicsPipeline {
+public:
+  MTLCompiledGraphicsPipelineImpl(MTLD3D11Device *pDevice,
+                              MTL_GRAPHICS_PIPELINE_DESC *pDesc,
+                              PipelineArchive *pArchive, bool WarmUp)
+      : archive_(pArchive), warm_up_(WarmUp),
+        num_rtvs(pDesc->NumColorAttachments),
+        depth_stencil_format(pDesc->DepthStencilFormat),
+        topology_class(pDesc->TopologyClass), device_(pDevice),
+        pBlendState(pDesc->BlendState),
+        RasterizationEnabled(pDesc->RasterizationEnabled),
+        SampleCount(pDesc->SampleCount) {
+    uint32_t unorm_output_reg_mask = 0;
+    for (unsigned i = 0; i < num_rtvs; i++) {
+      rtv_formats[i] = pDesc->ColorAttachmentFormats[i];
+      unorm_output_reg_mask |= (uint32_t(IsUnorm8RenderTargetFormat(pDesc->ColorAttachmentFormats[i])) << i);
+    }
+
+    // SC6 fork: the vertex function packs its varyings, one float4 a register, where nothing between it and the pixel
+    // shader writes them on its own (no geometry shader of any kind) and the pixel shader takes every input as a plain
+    // one: it pulls none (FineShading also covers EvaluateAttribute*; a partial sample mask pulls centroids) and reads
+    // none at a vertex (mullion.splitVaryings, d3d11_sc6_paths.hpp). The pipeline's settings key says it, so that a
+    // reload of sc6-optimizations.ini after the lookup cannot store a pipeline under the other setting.
+    bool packed_varyings = false;
+    const char *split_reason = "mullion.splitVaryings is on";
+    if (Sc6SettingsKeyPacksVaryings(pDesc->SettingsKey)) {
+      MTL_PIXEL_SHADER_REFLECTION ps = pDesc->PixelShader ? pDesc->PixelShader->reflection().PixelShader : MTL_PIXEL_SHADER_REFLECTION{};
+      split_reason = !pDesc->PixelShader || !pDesc->RasterizationEnabled ? "no pixel shader"
+                     : pDesc->GSPassthrough != ~0u || pDesc->GeometryShader ? "a geometry shader"
+                     : pDesc->SampleMask != 0xffffffff                       ? "a partial sample mask"
+                     : ps.FineShading                                         ? "the pixel shader evaluates or runs per sample"
+                     : ps.VertexValues                                        ? "the pixel shader reads inputs at vertices"
+                                                                              : nullptr;
+      packed_varyings = !split_reason;
+    }
+    Sc6WatchPackedVaryings(packed_varyings, split_reason);
+
+    if (pDesc->GSPassthrough == kGSLayered && pDesc->GeometryShader)
+      VertexShader = pDesc->VertexShader->get_shader(
+          ShaderVariantGeometryLayeredVertex{pDesc->InputLayout, pDesc->GeometryShader});
+    else
+      VertexShader = pDesc->VertexShader->get_shader(ShaderVariantVertex{
+          pDesc->InputLayout, pDesc->GSPassthrough, !pDesc->RasterizationEnabled, pDesc->ClipDistances != 0,
+          packed_varyings});
+
+    if (pDesc->PixelShader) {
+      ShaderVariantPixel variant{
+          pDesc->SampleMask, pDesc->BlendState->IsDualSourceBlending(),
+          depth_stencil_format == WMTPixelFormatInvalid,
+          unorm_output_reg_mask, pDesc->PipelineStatistics, pDesc->BlendState->IsAlphaToCoverage(),
+          pDesc->CenteredSamples, pDesc->SingleRasterSample, pDesc->PairedSamples, pDesc->ClipDistances};
+      variant.packed_varyings = packed_varyings;
+      PixelShader = pDesc->PixelShader->get_pixel_shader(variant, {rtv_formats, num_rtvs}, pDesc->BlendState);
+      ps_valid_render_targets = pDesc->PixelShader->reflection().PSValidRenderTargets;
+    } else {
+      PixelShader = nullptr;
+      ps_valid_render_targets = 0;
+    }
+  }
+
+  void GetPipeline(MTL_COMPILED_GRAPHICS_PIPELINE *pPipeline, bool statistics) final {
+    if (statistics && description->PixelShader && !description->PipelineStatistics) {
+      auto desc = *description;
+      desc.PipelineStatistics = true;
+      MTLCompiledGraphicsPipeline *pipeline;
+      device_->CreateGraphicsPipeline(&desc, &pipeline);
+      return pipeline->GetPipeline(pPipeline);
+    }
+    WaitUntilPipelineReady(ready_);
+    *pPipeline = {state_};
+  }
+
+  ThreadpoolWork *RunThreadpoolWork() {
+
+    TRACE("Start compiling 1 PSO");
+
+    WMT::Reference<WMT::Error> err;
+    MTL_COMPILED_SHADER vs, ps;
+    if (!VertexShader->GetShader(&vs)) {
+      return VertexShader;
+    }
+    if (PixelShader && !PixelShader->GetShader(&ps)) {
+      return PixelShader;
+    }
+
+    WMTRenderPipelineInfo info;
+    WMT::InitializeRenderPipelineInfo(info);
+
+    info.vertex_function = vs.Function;
+
+    if (PixelShader) {
+      info.fragment_function = ps.Function;
+    }
+    info.rasterization_enabled = RasterizationEnabled;
+
+    for (unsigned i = 0; i < num_rtvs; i++) {
+      if (rtv_formats[i] == WMTPixelFormatInvalid)
+        continue;
+      info.colors[i].pixel_format = rtv_formats[i];
+    }
+
+    if (depth_stencil_format != WMTPixelFormatInvalid) {
+      info.depth_pixel_format = depth_stencil_format;
+    }
+    if (DepthStencilPlanarFlags(depth_stencil_format) & 2) {
+      info.stencil_pixel_format = depth_stencil_format;
+    }
+
+    if (pBlendState) {
+      pBlendState->SetupMetalPipelineDescriptor((WMTRenderPipelineBlendInfo *)&info, num_rtvs, ps_valid_render_targets);
+    }
+    // explicit shader coverage disables A2C (D3D11.3 17.18)
+    if (description->PixelShader && description->PixelShader->reflection().PixelShader.HasCoverageOutput)
+      info.alpha_to_coverage_enabled = false;
+
+    info.input_primitive_topology = topology_class;
+    info.raster_sample_count = SampleCount;
+    info.immutable_vertex_buffers = (1 << 16) | (1 << 29) | (1 << 30);
+    info.immutable_fragment_buffers = (1 << 29) | (1 << 30);
+
+    bool add_to_archive = false;
+    if (archive_)
+      state_ = archive_->NewRenderPipelineState(info, err, add_to_archive);
+    else
+      state_ = device_->GetMTLDevice().newRenderPipelineState(info, err);
+
+    if (state_ == nullptr) {
+      if (warm_up_) {
+        // a stale warm-up record; the game may never use this pipeline
+        WARN("Failed to create warm-up PSO: ", err.description().getUTF8String());
+        archive_->OnWarmUpFinished(false);
+      } else {
+        ERR("Failed to create PSO: ", err.description().getUTF8String());
+      }
+      return this;
+    }
+
+    if (add_to_archive) {
+      // the pipeline is usable now: publish it before the archive copy, so an encoder waiting in GetPipeline() does
+      // not wait for that copy
+      SetIsDone(true);
+      archive_->AddRenderPipeline(info);
+    }
+    if (warm_up_)
+      archive_->OnWarmUpFinished(true);
+
+    TRACE("Compiled 1 PSO");
+
+    return this;
+  }
+
+  bool GetIsDone() { return ready_; }
+
+  void SetIsDone(bool state) {
+    ready_.store(state);
+    ready_.notify_all();
+  }
+
+private:
+  PipelineArchive *archive_;
+  bool warm_up_;
+  UINT num_rtvs;
+  UINT ps_valid_render_targets;
+  WMTPixelFormat rtv_formats[8];
+  WMTPixelFormat depth_stencil_format;
+  WMTPrimitiveTopologyClass topology_class;
+  MTLD3D11Device *device_;
+  std::atomic_bool ready_;
+  CompiledShader *VertexShader;
+  CompiledShader *PixelShader;
+  IMTLD3D11BlendState *pBlendState;
+  WMT::Reference<WMT::RenderPipelineState> state_;
+  bool RasterizationEnabled;
+  UINT SampleCount;
+};
+
+std::unique_ptr<MTLCompiledGraphicsPipeline>
+CreateGraphicsPipeline(MTLD3D11Device *pDevice,
+                       MTL_GRAPHICS_PIPELINE_DESC *pDesc,
+                       PipelineArchive *pArchive, bool WarmUp) {
+  return std::make_unique<MTLCompiledGraphicsPipelineImpl>(pDevice, pDesc, pArchive, WarmUp);
+}
+
+class MTLCompiledComputePipelineImpl
+    : public MTLCompiledComputePipeline {
+public:
+  MTLCompiledComputePipelineImpl(MTLD3D11Device *pDevice, ManagedShader shader,
+                                 PipelineArchive *pArchive, bool WarmUp)
+      : archive_(pArchive), warm_up_(WarmUp), device_(pDevice) {
+    ComputeShader = shader->get_shader(ShaderVariantDefault{});
+    uint32_t total_tgsize = shader->reflection().ThreadgroupSize[0] *
+                            shader->reflection().ThreadgroupSize[1] *
+                            shader->reflection().ThreadgroupSize[2];
+    // FIXME: might be different on AMD GPU, if it's ever supported
+    tgsize_is_multiple_of_sgwidth = (total_tgsize % 32) == 0;
+  }
+
+  void GetPipeline(MTL_COMPILED_COMPUTE_PIPELINE *pPipeline) final {
+    WaitUntilPipelineReady(ready_);
+    *pPipeline = {state_};
+  }
+
+  ThreadpoolWork *RunThreadpoolWork() {
+
+    TRACE("Start compiling 1 PSO");
+
+    WMT::Reference<WMT::Error> err;
+    MTL_COMPILED_SHADER cs;
+    if (!ComputeShader->GetShader(&cs)) {
+      return ComputeShader;
+    }
+
+    WMTComputePipelineInfo info;
+    WMT::InitializeComputePipelineInfo(info);
+
+    info.compute_function = cs.Function;
+    info.tgsize_is_multiple_of_sgwidth = tgsize_is_multiple_of_sgwidth;
+    info.immutable_buffers = (1 << 29) | (1 << 30);
+
+    bool add_to_archive = false;
+    if (archive_)
+      state_ = archive_->NewComputePipelineState(info, err, add_to_archive);
+    else
+      state_ = device_->GetMTLDevice().newComputePipelineState(info, err);
+
+    if (!state_) {
+      if (warm_up_) {
+        WARN("Failed to create warm-up compute PSO: ", err.description().getUTF8String());
+        archive_->OnWarmUpFinished(false);
+      } else {
+        ERR("Failed to create compute PSO: ", err.description().getUTF8String());
+      }
+      return this;
+    }
+
+    if (add_to_archive) {
+      SetIsDone(true);
+      archive_->AddComputePipeline(info);
+    }
+    if (warm_up_)
+      archive_->OnWarmUpFinished(true);
+
+    TRACE("Compiled 1 PSO");
+
+    return this;
+  }
+
+  bool GetIsDone() { return ready_; }
+
+  void SetIsDone(bool state) {
+    ready_.store(state);
+    ready_.notify_all();
+  }
+
+private:
+  PipelineArchive *archive_;
+  bool warm_up_;
+  MTLD3D11Device *device_;
+  std::atomic_bool ready_;
+  CompiledShader *ComputeShader;
+  WMT::Reference<WMT::ComputePipelineState> state_;
+  bool tgsize_is_multiple_of_sgwidth;
+};
+
+std::unique_ptr<MTLCompiledComputePipeline>
+CreateComputePipeline(MTLD3D11Device *pDevice, ManagedShader ComputeShader,
+                      PipelineArchive *pArchive, bool WarmUp) {
+  return std::make_unique<MTLCompiledComputePipelineImpl>(pDevice, ComputeShader, pArchive, WarmUp);
+}
+
+} // namespace mullion

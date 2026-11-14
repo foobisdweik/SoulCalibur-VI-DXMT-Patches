@@ -1,0 +1,899 @@
+#include "d3d11_pipeline_cache.hpp"
+#include "airconv_public.h"
+#include "d3d11_device.hpp"
+#include "d3d11_shader.hpp"
+#include "d3d11_pipeline.hpp"
+#include "d3d11_pipeline_archive.hpp"
+#include "d3d11_sc6_paths.hpp"
+#include "d3d11_sc6_toggles.hpp"
+#include "mullion_shader_cache.hpp"
+#include "mullion_stream_output.hpp"
+#include "DXBCParser/BlobContainer.h"
+#include "DXBCParser/d3d12tokenizedprogramformat.hpp"
+#include "mullion_tasks.hpp"
+#include "log/log.hpp"
+#include "config/config.hpp"
+#include "util_env.hpp"
+#include "sha1/sha1_util.hpp"
+#include "util_md5.hpp"
+#include "../d3d10/d3d10_shader.hpp"
+#include <optional>
+#include "../d3d10/d3d10_input_layout.hpp"
+#include <chrono>
+#include <cstring>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_set>
+
+namespace mullion {
+
+class MTLD3D11InputLayout final
+    : public MTLD3D11DeviceChild<IMTLD3D11InputLayout> {
+public:
+  MTLD3D11InputLayout(MTLD3D11Device *device, ManagedInputLayout input_layout)
+      : MTLD3D11DeviceChild<IMTLD3D11InputLayout>(device),
+        input_layout(input_layout), d3d10(this) {}
+
+  ~MTLD3D11InputLayout() {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+                                           void **ppvObject) final {
+    if (ppvObject == nullptr)
+      return E_POINTER;
+
+    *ppvObject = nullptr;
+
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3D11DeviceChild) ||
+        riid == __uuidof(ID3D11InputLayout) ||
+        riid == __uuidof(IMTLD3D11InputLayout)) {
+      *ppvObject = ref(this);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(ID3D10DeviceChild) ||
+        riid == __uuidof(ID3D10InputLayout)) {
+      *ppvObject = ref(&d3d10);
+      return S_OK;
+    }
+
+    if (logQueryInterfaceError(__uuidof(ID3D11InputLayout), riid)) {
+      WARN("D3D311InputLayout: Unknown interface query ", str::format(riid));
+    }
+
+    return E_NOINTERFACE;
+  };
+
+  ManagedInputLayout GetManagedInputLayout() override { return input_layout; }
+
+private:
+  ManagedInputLayout input_layout;
+  MTLD3D10InputLayout d3d10;
+};
+
+template <> struct task_trait<ThreadpoolWork *> {
+  ThreadpoolWork *run_task(ThreadpoolWork *task) {
+    return task->RunThreadpoolWork();
+  }
+  bool get_done(ThreadpoolWork *task) { return task->GetIsDone(); }
+  void set_done(ThreadpoolWork *task) { task->SetIsDone(true); }
+};
+
+/* SC6 fork: a shader variant under the sc6-optimizations.ini settings it was converted with (Sc6SettingsKey()), so a
+   reload of the file converts the variant again */
+struct SettingsVariant {
+  uint64_t settings;
+  ShaderVariant variant;
+  bool operator==(const SettingsVariant &) const = default;
+};
+struct SettingsVariantHash {
+  size_t operator()(const SettingsVariant &v) const noexcept {
+    HashState state;
+    state.add((size_t)v.settings);
+    state.add(std::hash<ShaderVariant>{}(v.variant));
+    return state;
+  }
+};
+
+// SC6 fork: a compute pipeline under its settings, as SettingsVariant
+struct SettingsComputeShader {
+  uint64_t settings;
+  ManagedShader shader;
+  bool operator==(const SettingsComputeShader &) const = default;
+};
+struct SettingsComputeShaderHash {
+  size_t operator()(const SettingsComputeShader &v) const noexcept {
+    HashState state;
+    state.add((size_t)v.settings);
+    state.add((size_t)v.shader);
+    return state;
+  }
+};
+
+class PipelineCache : public MTLD3D11PipelineCacheBase {
+
+  class CachedSM50Shader final : public Shader {
+    PipelineCache *cache;
+    sm50_shader_t shader = nullptr;
+    Sha1Digest sha1_;
+    MTL_SHADER_REFLECTION reflection_;
+    MTL_SM50_SHADER_ARGUMENT *arguments_info_buffer;
+    std::unordered_map<SettingsVariant, std::unique_ptr<CompiledShader>, SettingsVariantHash> variants;
+    // a pipeline asks for variants where it is made, and again where it is built
+    mullion::mutex variants_mutex;
+
+  public:
+    CachedSM50Shader(PipelineCache *cache, sm50_shader_t shader_transferred,
+                     const Sha1Digest &hash, MTL_SHADER_REFLECTION &reflection)
+        : cache(cache), shader(shader_transferred), sha1_(hash),
+          reflection_(reflection) {
+      if (reflection_.NumConstantBuffers + reflection_.NumArguments) {
+        arguments_info_buffer = (MTL_SM50_SHADER_ARGUMENT *)malloc(
+            sizeof(MTL_SM50_SHADER_ARGUMENT) *
+            (reflection_.NumConstantBuffers + reflection_.NumArguments));
+        SM50GetArgumentsInfo(shader, arguments_info_buffer,
+                             arguments_info_buffer +
+                                 reflection_.NumConstantBuffers);
+      } else {
+        arguments_info_buffer = nullptr;
+      }
+    }
+
+    ~CachedSM50Shader() {
+      if (shader) {
+        SM50Destroy(shader);
+        if (arguments_info_buffer)
+          free(arguments_info_buffer);
+        shader = nullptr;
+      }
+    };
+
+    CachedSM50Shader(CachedSM50Shader &&moved) = delete;
+    CachedSM50Shader(const CachedSM50Shader &copy) = delete;
+
+    virtual sm50_shader_t handle() { return shader; };
+    virtual MTL_SHADER_REFLECTION &reflection() { return reflection_; }
+    virtual MTL_SM50_SHADER_ARGUMENT *constant_buffers_info() {
+      return arguments_info_buffer;
+    };
+    virtual MTL_SM50_SHADER_ARGUMENT *arguments_info() {
+      return arguments_info_buffer + reflection_.NumConstantBuffers;
+    };
+    virtual CompiledShader *get_shader(ShaderVariant variant) {
+      std::lock_guard<mullion::mutex> lock(variants_mutex);
+      auto c = variants.insert({SettingsVariant{Sc6SettingsKey(), variant}, nullptr});
+      if (c.second) {
+        c.first->second = std::visit(
+            [=, this](auto var) {
+              return CreateVariantShader(cache->device, this, var);
+            },
+            variant);
+        cache->scheduler_.submit(c.first->second.get());
+      }
+      return c.first->second.get();
+    }
+    virtual const Sha1Digest &sha1() { return sha1_; };
+
+#ifdef MULLION_DEBUG
+    void *bytecode;
+    size_t bytecode_length;
+
+    virtual void dump() {
+      std::fstream dump_out;
+      dump_out.open("shader_dump_" + sha1_.string() + ".cso",
+                    std::ios::out | std::ios::binary);
+      if (dump_out) {
+        dump_out.write((char *)bytecode, bytecode_length);
+      }
+      dump_out.close();
+      WARN("shader dumped to ./shader_dump_" + sha1_.string() + ".cso");
+    }
+#else
+    virtual void dump() {}
+#endif
+
+    virtual WMT::Reference<WMT::DispatchData> find_cached_variant(Sha1Digest &variant_digest) final {
+      auto reader = cache->scache_.getReader();
+      if (reader)
+        return reader->get(std::make_pair(sha1_, variant_digest));
+      return {};
+    };
+    virtual void update_cached_variant(Sha1Digest &variant_digest, WMT::DispatchData data) final {
+      auto writer = cache->scache_.getWriter();
+      if (writer)
+        writer->set(std::make_pair(sha1_, variant_digest), data);
+    }
+  };
+
+  class CachedInputLayout final : public InputLayout {
+  private:
+  public:
+    CachedInputLayout(
+        std::vector<MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC> &&attributes,
+        uint32_t input_slot_mask)
+        : attributes_(attributes), input_slot_mask_(input_slot_mask) {
+      Sha1HashState h;
+      h.update(input_slot_mask);
+      h.update(attributes_.size());
+      for (auto &el : attributes_) {
+        h.update(el);
+      }
+      sha1_ = h.final();
+    }
+
+    virtual uint32_t input_slot_mask() final { return input_slot_mask_; }
+
+    virtual uint32_t input_layout_element(
+        MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC **ppElements) final {
+      *ppElements = attributes_.data();
+      return attributes_.size();
+    }
+
+    virtual Sha1Digest &sha1() final { return sha1_; }
+
+    std::vector<MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC> attributes_;
+    Sha1Digest sha1_;
+    uint32_t input_slot_mask_;
+  };
+
+  ShaderCache& scache_;
+
+  MTLD3D11Device *device;
+  StateObjectCache<D3D11_BLEND_DESC1, IMTLD3D11BlendState> blend_states;
+
+  std::unordered_map<MTL_INPUT_LAYOUT_DESC, std::unique_ptr<CachedInputLayout>> input_layouts;
+  mullion::mutex mutex_ia_;
+
+  StateObjectCache<MTL_STREAM_OUTPUT_DESC, IMTLD3D11StreamOutputLayout>
+      so_layouts;
+  mullion::mutex mutex_so_;
+
+  std::unordered_map<Sha1Digest, std::unique_ptr<CachedSM50Shader>> shaders_;
+  std::shared_mutex mutex_shares;
+
+  std::unordered_map<MTL_GRAPHICS_PIPELINE_DESC, std::unique_ptr<MTLCompiledGraphicsPipeline>> pipelines_;
+  // SC6 fork: warm-up pipelines that the game has not asked for yet
+  std::unordered_set<ThreadpoolWork *> warm_pending_;
+  mullion::mutex mutex_;
+
+  std::unordered_map<MTL_GRAPHICS_PIPELINE_DESC, std::unique_ptr<MTLCompiledGeometryPipeline>> pipelines_gs_;
+  std::unordered_set<ThreadpoolWork *> warm_pending_gs_;
+  mullion::mutex mutex_gs_;
+
+  std::unordered_map<MTL_GRAPHICS_PIPELINE_DESC, std::unique_ptr<MTLCompiledTessellationMeshPipeline>> pipelines_ts_;
+  mullion::mutex mutex_ts_;
+
+  std::unordered_map<SettingsComputeShader, std::unique_ptr<MTLCompiledComputePipeline>, SettingsComputeShaderHash>
+      pipelines_cs_;
+  std::unordered_set<ThreadpoolWork *> warm_pending_cs_;
+  mullion::mutex mutex_cs_;
+
+  // SC6 fork: declared before scheduler_, so it is destroyed after the workers stop and can write its files last.
+  // Null unless d3d11.pipelineArchive is on.
+  std::unique_ptr<PipelineArchive> archive_;
+
+  task_scheduler<ThreadpoolWork *> scheduler_;
+
+  // SC6 fork: the thread that creates the archive's stored shaders at start (eager warm-up). Declared after
+  // scheduler_ and joined in ~PipelineCache(), so it stops before the workers and the archive go away.
+  std::once_flag eager_once_;
+  std::atomic<bool> eager_stop_ = false;
+  mullion::thread eager_;
+  // SC6 fork: guards eager_ and the fields below, which a reload of sc6-optimizations.ini changes on its watcher thread
+  std::mutex eager_mutex_;
+  // whether the device is complete (the first shader or pipeline request), so that eager warm-up may start
+  bool eager_allowed_ = false;
+  // whether WideWarmUpThreads's limit is in force
+  bool wide_applied_ = false;
+  int toggle_listener_ = 0;
+
+  bool EagerWanted() {
+    return Sc6ToggleValue(Sc6Toggle::EagerWarmUp)
+        .value_or(Config::getInstance().getOption<bool>("d3d11.pipelineEagerWarmUp", true));
+  }
+
+  /* SC6 fork: WideWarmUpThreads, at the device's creation and after each reload. Off restores the scheduler's own
+     limit, a quarter of the cores (task_scheduler's constructor). */
+  void ApplyWideWarmUp(bool first) {
+    bool wide = Sc6ToggleValue(Sc6Toggle::WideWarmUpThreads).value_or(true) && archive_;
+    if (!first && wide == wide_applied_)
+      return;
+    wide_applied_ = wide;
+    if (wide) {
+      int n = Config::getInstance().getOption<int>("d3d11.pipelineWarmUpThreads", 0);
+      if (n <= 0)
+        n = std::max<int>(1, (int)mullion::thread::hardware_concurrency() - 2);
+      scheduler_.set_max_low_running(n);
+      Sc6WatchLog(Sc6Toggle::WideWarmUpThreads, str::format("on: at most ", n, " warm-up compiles at once"));
+    } else {
+      if (!first)
+        scheduler_.set_max_low_running(std::max(1u, mullion::thread::hardware_concurrency() / 4));
+      Sc6WatchLog(Sc6Toggle::WideWarmUpThreads, "off: the scheduler's own limit for warm-up compiles");
+    }
+  }
+
+  /* SC6 fork: after a reload of sc6-optimizations.ini. EagerWarmUp turned off stops the warm-up thread after the
+     shader it creates; turned on, it starts the thread again, which skips the shaders that exist. */
+  void OnTogglesChanged() {
+    std::lock_guard<std::mutex> lock(eager_mutex_);
+    ApplyWideWarmUp(false);
+    if (!eager_allowed_)
+      return;
+    bool eager = EagerWanted();
+    bool running = eager_.joinable() && !eager_stop_.load();
+    if (!eager && running) {
+      eager_stop_.store(true);
+      Sc6WatchLog(Sc6Toggle::EagerWarmUp, "turned off: the warm-up thread stops");
+    } else if (eager && !running) {
+      if (eager_.joinable())
+        eager_.join();
+      eager_stop_.store(false);
+      Sc6WatchLog(Sc6Toggle::EagerWarmUp, "turned on: the warm-up thread starts");
+      RunEagerWarmUp();
+    }
+  }
+
+  /**
+  SC6 fork: create every stored shader that a recorded pipeline waits for, on a thread of its own. Each created
+  shader queues the recorded pipelines that now have all their shaders (WarmUpPipelines), so most of the game's
+  pipelines compile at start instead of at the first draw. The game's own CreateVertexShader (and the others) later
+  find these shaders by hash. Runs once, at the first shader or pipeline request, when the device is complete.
+   */
+  void StartEagerWarmUp() {
+    std::lock_guard<std::mutex> lock(eager_mutex_);
+    eager_allowed_ = archive_ != nullptr;
+    // SC6 fork: sc6-optimizations.ini's EagerWarmUp decides in place of the option
+    bool eager = EagerWanted();
+    Sc6WatchLog(Sc6Toggle::EagerWarmUp, eager ? "on" : "off");
+    if (!archive_ || !eager)
+      return;
+    RunEagerWarmUp();
+  }
+
+  // starts eager_; the caller holds eager_mutex_
+  void RunEagerWarmUp() {
+    eager_ = mullion::thread([this]() {
+      env::setThreadName("mullion-pso-prewarm");
+      auto start = std::chrono::steady_clock::now();
+      auto shaders = archive_->StoredShadersForWarmUp();
+      Sc6WatchLog(Sc6Toggle::EagerWarmUp, str::format("creating ", shaders.size(), " stored shaders"));
+      unsigned created = 0;
+      for (auto &[sha1, code] : shaders) {
+        if (eager_stop_.load(std::memory_order_relaxed))
+          break;
+        if (!FindShader(sha1) && CreateShader(code.data(), code.size()))
+          created++;
+      }
+      auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
+      WARN("PipelineArchive: created ", created, " of ", shaders.size(), " stored shaders for warm-up in ", ms.count(),
+           " ms");
+      archive_->LogStats("after creating the stored shaders");
+      // SC6 fork: WatchEagerWarmUp and WatchWideWarmUpThreads follow the queued compiles until they are done
+      if (!Sc6Watch(Sc6Toggle::EagerWarmUp) && !Sc6Watch(Sc6Toggle::WideWarmUpThreads))
+        return;
+      uint64_t last_done = ~0ull;
+      for (unsigned idle = 0; idle < 30 && !eager_stop_.load(std::memory_order_relaxed);) {
+        ::Sleep(2000);
+        auto queued = archive_->WarmUpQueued(), done = archive_->WarmUpDone();
+        idle = done == last_done ? idle + 1 : 0;
+        if (done != last_done) {
+          auto s = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start);
+          Sc6WatchLog(Sc6Toggle::EagerWarmUp, str::format(done, " of ", queued, " queued pipelines done after ",
+                                                          s.count(), " s"));
+          Sc6WatchLog(Sc6Toggle::WideWarmUpThreads, str::format(scheduler_.get_running_threads(),
+                                                                " compile threads running"));
+        }
+        last_done = done;
+        if (queued && done >= queued)
+          break;
+      }
+      Sc6WatchLog(Sc6Toggle::EagerWarmUp, eager_stop_.load() ? "the warm-up thread stopped"
+                                                            : "every queued pipeline is done");
+    });
+  }
+
+  CachedSM50Shader *CreateShader(const void *pBytecode,
+                                 uint32_t BytecodeLength) {
+    std::call_once(eager_once_, [this]() { StartEagerWarmUp(); });
+    auto sha1 = Sha1HashState::compute(pBytecode, BytecodeLength);
+    {
+      std::shared_lock<std::shared_mutex> lock(mutex_shares);
+      auto result = shaders_.find(sha1);
+      if (result != shaders_.end()) {
+        return shaders_.at(sha1).get();
+      }
+    }
+    sm50_error_t err;
+    sm50_shader_t sm50;
+    MTL_SHADER_REFLECTION reflection;
+    if (SM50Initialize(pBytecode, BytecodeLength, &sm50, &reflection, &err)) {
+      ERR("Failed to initialize shader: ", SM50GetErrorMessageString(err));
+      SM50FreeError(err);
+      return nullptr;
+    }
+    auto shader = std::make_unique<CachedSM50Shader>(this, sm50, sha1, reflection);
+    CachedSM50Shader *created;
+    {
+      std::unique_lock<std::shared_mutex> lock(mutex_shares);
+      auto result = shaders_.find(sha1);
+      if (result != shaders_.end()) {
+        return shaders_.at(sha1).get();
+      }
+#ifdef MULLION_DEBUG
+      shader->bytecode = malloc(BytecodeLength);
+      shader->bytecode_length = BytecodeLength;
+      memcpy(shader->bytecode, pBytecode, BytecodeLength);
+#endif
+      created = shaders_.emplace(sha1, std::move(shader)).first->second.get();
+    }
+    if (archive_) {
+      archive_->NoteShaderCode(sha1, pBytecode, BytecodeLength);
+      WarmUpPipelines(sha1);
+    }
+    return created;
+  }
+
+  CachedSM50Shader *
+  FindShader(const Sha1Digest &sha1) {
+    std::shared_lock<std::shared_mutex> lock(mutex_shares);
+    auto result = shaders_.find(sha1);
+    return result != shaders_.end() ? result->second.get() : nullptr;
+  }
+
+  /**
+  SC6 fork: queue the recorded pipelines whose shaders all exist now that `sha1` was created. A record that no
+  longer fits (a shader or state object cannot be rebuilt) is skipped. A pipeline that the game already created is
+  not compiled again, because the lookup finds it.
+   */
+  void
+  WarmUpPipelines(const Sha1Digest &sha1) {
+    std::vector<PipelineRecord> ready;
+    archive_->OnShaderCreated(sha1, ready);
+    for (auto &record : ready) {
+      if (record.kind == PipelineRecord::Compute) {
+        auto cs = FindShader(record.shaders[PipelineRecord::SlotCompute]);
+        if (!cs)
+          continue;
+        MTL_COMPUTE_PIPELINE_DESC desc{cs};
+        MTLCompiledComputePipeline *pipeline;
+        if (GetComputePipelineImpl(&desc, &pipeline, true))
+          archive_->OnWarmUpQueued();
+        continue;
+      }
+
+      MTL_GRAPHICS_PIPELINE_DESC desc{};
+      ManagedShader shaders[PipelineRecord::NumSlots] = {};
+      bool missing = false;
+      for (unsigned slot = 0; slot < PipelineRecord::NumSlots; slot++) {
+        if (record.shader_mask & (1 << slot)) {
+          shaders[slot] = FindShader(record.shaders[slot]);
+          missing |= !shaders[slot];
+        }
+      }
+      if (missing)
+        continue;
+      desc.VertexShader = shaders[PipelineRecord::SlotVertex];
+      desc.PixelShader = shaders[PipelineRecord::SlotPixel];
+      desc.HullShader = shaders[PipelineRecord::SlotHull];
+      desc.DomainShader = shaders[PipelineRecord::SlotDomain];
+      desc.GeometryShader = shaders[PipelineRecord::SlotGeometry];
+
+      IMTLD3D11BlendState *blend_state = nullptr;
+      if (FAILED(blend_states.CreateStateObject(&record.blend, &blend_state)) || !blend_state)
+        continue;
+      // the state object cache keeps the object alive after this release
+      desc.BlendState = blend_state;
+      blend_state->Release();
+
+      desc.InputLayout =
+          record.has_input_layout ? GetOrCreateInputLayout(MTL_INPUT_LAYOUT_DESC(record.input_layout)) : nullptr;
+      desc.SOLayout = nullptr;
+      desc.NumColorAttachments = record.num_color_attachments;
+      for (unsigned i = 0; i < 8; i++)
+        desc.ColorAttachmentFormats[i] = WMTPixelFormat(record.color_formats[i]);
+      desc.DepthStencilFormat = WMTPixelFormat(record.depth_stencil_format);
+      desc.TopologyClass = WMTPrimitiveTopologyClass(record.topology_class);
+      desc.RasterizationEnabled = record.rasterization_enabled;
+      desc.SampleCount = record.sample_count;
+      desc.GSStripTopology = record.gs_strip_topology;
+      desc.IndexBufferFormat = SM50_INDEX_BUFFER_FORMAT(record.index_buffer_format);
+      desc.SampleMask = record.sample_mask;
+      desc.CenteredSamples = record.centered_samples;
+      desc.SingleRasterSample = record.single_raster_sample;
+      desc.PairedSamples = record.paired_samples;
+      desc.ClipDistances = record.clip_distances;
+      desc.GSPassthrough = record.gs_passthrough;
+      desc.InputPrimitive = record.input_primitive;
+      desc.PassThrough = record.pass_through;
+      desc.QuadLines = record.quad_lines;
+      desc.PipelineStatistics = record.pipeline_statistics;
+
+      if (record.kind == PipelineRecord::Geometry) {
+        MTLCompiledGeometryPipeline *pipeline;
+        if (GetGeometryPipelineImpl(&desc, &pipeline, true))
+          archive_->OnWarmUpQueued();
+        continue;
+      }
+      MTLCompiledGraphicsPipeline *pipeline;
+      if (GetGraphicsPipelineImpl(&desc, &pipeline, true))
+        archive_->OnWarmUpQueued();
+    }
+  }
+
+  // the stage a container's code is of, which each Create call takes its own of (Wine's test_stream_output has a
+  // geometry shader made of vertex bytecode refused on Windows)
+  std::optional<microsoft::D3D10_SB_TOKENIZED_PROGRAM_TYPE>
+  Stage(const void *pBytecode, uint32_t BytecodeLength) {
+    using namespace microsoft;
+    CDXBCParser parser;
+    // Direct3D refuses a container that is not what its hash says before it reads anything else of it
+    if (FAILED(parser.ReadDXBC(pBytecode, BytecodeLength)) ||
+        memcmp(parser.GetHash(), md5::hashDxbcBinary(pBytecode, BytecodeLength).data.data(), sizeof(DXBCHash)))
+      return {};
+    auto code = parser.FindNextMatchingBlob(DXBC_GenericShaderEx);
+    if (code == DXBC_BLOB_NOT_FOUND)
+      code = parser.FindNextMatchingBlob(DXBC_GenericShader);
+    if (code == DXBC_BLOB_NOT_FOUND)
+      return {};
+    auto token = *(const uint32_t *)parser.GetBlob(code);
+    auto stage = DECODE_D3D10_SB_TOKENIZED_PROGRAM_TYPE(token);
+    auto major = DECODE_D3D10_SB_TOKENIZED_PROGRAM_MAJOR_VERSION(token);
+    auto minor = DECODE_D3D10_SB_TOKENIZED_PROGRAM_MINOR_VERSION(token);
+    // Microsoft Learn, Specifying Compiler Targets: SM4.0/4.1/5.0 require FL10.0/10.1/11.0; FL9 uses level_9 code
+    if (major < 4 || major > 5 || minor > (major == 4 ? 1u : 0u) ||
+        (major < 5 && (stage == D3D11_SB_HULL_SHADER || stage == D3D11_SB_DOMAIN_SHADER)))
+      return {};
+    auto minimum = major == 5 ? D3D_FEATURE_LEVEL_11_0
+                   : minor    ? D3D_FEATURE_LEVEL_10_1
+                   : (stage == D3D10_SB_VERTEX_SHADER || stage == D3D10_SB_PIXEL_SHADER) &&
+                           parser.FindNextMatchingBlob(DXBC_FeatureLevel9Shader) != DXBC_BLOB_NOT_FOUND
+                       ? D3D_FEATURE_LEVEL_9_1
+                       : D3D_FEATURE_LEVEL_10_0;
+    if (device->GetFeatureLevel() < minimum)
+      return {};
+    return stage;
+  }
+
+  virtual HRESULT AddVertexShader(const void *pBytecode,
+                                  uint32_t BytecodeLength,
+                                  ID3D11VertexShader **ppShader) override {
+    if (Stage(pBytecode, BytecodeLength) != microsoft::D3D10_SB_VERTEX_SHADER)
+      return E_INVALIDARG;
+    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
+    if (!managed_shader) {
+      return E_INVALIDARG;
+    }
+    if (!ppShader)
+      return S_FALSE;
+    *ppShader =
+        ref(new TShaderBase<ID3D11VertexShader, MTLD3D10VertexShader>(device, managed_shader));
+    return S_OK;
+  }
+
+  virtual HRESULT AddPixelShader(const void *pBytecode, uint32_t BytecodeLength,
+                                 ID3D11PixelShader **ppShader) override {
+    if (Stage(pBytecode, BytecodeLength) != microsoft::D3D10_SB_PIXEL_SHADER)
+      return E_INVALIDARG;
+    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
+    // SV_InnerCoverage needs conservative rasterization tier 3, which D3D11 here does not report
+    // (ConservativeRasterizationTier): a shader the device cannot run is refused
+    if (!managed_shader || managed_shader->reflection().PixelShader.InnerCoverage) {
+      return E_INVALIDARG;
+    }
+    if (!ppShader)
+      return S_FALSE;
+    *ppShader = ref(new TShaderBase<ID3D11PixelShader, MTLD3D10PixelShader>(device, managed_shader));
+    return S_OK;
+  }
+
+  virtual HRESULT AddHullShader(const void *pBytecode, uint32_t BytecodeLength,
+                                ID3D11HullShader **ppShader) override {
+    if (Stage(pBytecode, BytecodeLength) != microsoft::D3D11_SB_HULL_SHADER)
+      return E_INVALIDARG;
+    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
+    if (!managed_shader) {
+      return E_INVALIDARG;
+    }
+    if (!ppShader)
+      return S_FALSE;
+    *ppShader = ref(new TShaderBase<ID3D11HullShader>(device, managed_shader));
+    return S_OK;
+  }
+
+  virtual HRESULT AddDomainShader(const void *pBytecode,
+                                  uint32_t BytecodeLength,
+                                  ID3D11DomainShader **ppShader) override {
+    if (Stage(pBytecode, BytecodeLength) != microsoft::D3D11_SB_DOMAIN_SHADER)
+      return E_INVALIDARG;
+    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
+    if (!managed_shader) {
+      return E_INVALIDARG;
+    }
+    if (!ppShader)
+      return S_FALSE;
+    *ppShader =
+        ref(new TShaderBase<ID3D11DomainShader>(device, managed_shader));
+    return S_OK;
+  }
+
+  virtual HRESULT AddGeometryShader(const void *pBytecode,
+                                    uint32_t BytecodeLength,
+                                    ID3D11GeometryShader **ppShader) override {
+    if (Stage(pBytecode, BytecodeLength) != microsoft::D3D10_SB_GEOMETRY_SHADER)
+      return E_INVALIDARG;
+    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
+    if (!managed_shader) {
+      return E_INVALIDARG;
+    }
+    if (!ppShader)
+      return S_FALSE;
+    *ppShader =
+        ref(new TShaderBase<ID3D11GeometryShader, MTLD3D10GeometryShader>(device, managed_shader));
+    return S_OK;
+  }
+
+  virtual HRESULT AddComputeShader(const void *pBytecode,
+                                   uint32_t BytecodeLength,
+                                   ID3D11ComputeShader **ppShader) override {
+    if (Stage(pBytecode, BytecodeLength) != microsoft::D3D11_SB_COMPUTE_SHADER)
+      return E_INVALIDARG;
+    auto managed_shader = CreateShader(pBytecode, BytecodeLength);
+    if (!managed_shader) {
+      return E_INVALIDARG;
+    }
+    if (!ppShader)
+      return S_FALSE;
+    *ppShader =
+        ref(new TShaderBase<ID3D11ComputeShader>(device, managed_shader));
+    return S_OK;
+  }
+
+  HRESULT AddInputLayout(const void *pShaderBytecodeWithInputSignature,
+                         const D3D11_INPUT_ELEMENT_DESC *pInputElementDesc,
+                         UINT NumElements,
+                         IMTLD3D11InputLayout **ppInputLayout) override {
+    std::vector<MTL_SHADER_INPUT_LAYOUT_ELEMENT_DESC> buffer(NumElements);
+    uint32_t num_metal_ia_elements;
+    HRESULT hr;
+    if (FAILED(hr = ExtractMTLInputLayoutElements(
+            device, pShaderBytecodeWithInputSignature, pInputElementDesc,
+            NumElements, buffer.data(), &num_metal_ia_elements))) {
+      return hr;
+    }
+    if (!ppInputLayout)
+      return S_FALSE;
+    buffer.resize(num_metal_ia_elements);
+    *ppInputLayout = ref(new MTLD3D11InputLayout(device, GetOrCreateInputLayout(std::move(buffer))));
+    return hr;
+  }
+
+  // the cached input layout for a set of elements (also used by the pipeline archive's warm-up)
+  CachedInputLayout *
+  GetOrCreateInputLayout(MTL_INPUT_LAYOUT_DESC &&buffer) {
+    std::lock_guard<mullion::mutex> lock(mutex_ia_);
+    if (auto iter = input_layouts.find(buffer); iter != input_layouts.end())
+      return iter->second.get();
+    uint32_t input_slot_mask = 0;
+    for (auto &element : buffer) {
+      input_slot_mask |= (1 << element.Slot);
+    }
+    // the map key is a copy, because the layout object takes the buffer
+    MTL_INPUT_LAYOUT_DESC key = buffer;
+    return input_layouts.emplace(std::move(key), std::make_unique<CachedInputLayout>(std::move(buffer), input_slot_mask))
+        .first->second.get();
+  }
+
+  HRESULT
+  AddStreamOutputLayout(const void *pShaderBytecode, UINT BytecodeLength, UINT NumEntries,
+                        const D3D11_SO_DECLARATION_ENTRY *pEntries,
+                        UINT NumStrides, const UINT *pStrides,
+                        UINT RasterizedStream,
+                        IMTLD3D11StreamOutputLayout **ppSOLayout) override {
+    using namespace microsoft;
+    MTL_STREAM_OUTPUT_DESC desc{};
+    // the bytecode is the geometry shader, or the stage whose output goes out without one
+    auto stage = Stage(pShaderBytecode, BytecodeLength);
+    if (!stage || device->GetFeatureLevel() < D3D_FEATURE_LEVEL_10_0)
+      return E_INVALIDARG;
+    if (*stage == D3D10_SB_GEOMETRY_SHADER && !(desc.GeometryShader = CreateShader(pShaderBytecode, BytecodeLength)))
+      return E_INVALIDARG;
+    if (HRESULT hr = ExtractStreamOutputElements(
+            pShaderBytecode, std::span(pEntries, NumEntries), std::span(pStrides, NumStrides), desc.Elements
+        );
+        FAILED(hr))
+      return hr;
+    for (unsigned i = 0; i < std::min<UINT>(NumStrides, std::size(desc.Strides)); i++)
+      desc.Strides[i] = pStrides[i];
+    // a slot without a stride takes what its elements, each a component, take
+    for (auto &element : desc.Elements)
+      if (element.output_slot >= NumStrides)
+        desc.Strides[element.output_slot] =
+            std::max<uint32_t>(desc.Strides[element.output_slot], element.offset + sizeof(uint32_t));
+    desc.RasterizedStream = RasterizedStream;
+    std::lock_guard<mullion::mutex> lock(mutex_so_);
+    return so_layouts.CreateStateObject(&desc, ppSOLayout);
+  };
+
+  HRESULT AddBlendState(const D3D11_BLEND_DESC1 *pBlendDesc,
+                        IMTLD3D11BlendState **ppBlendState) override {
+    return blend_states.CreateStateObject(pBlendDesc, ppBlendState);
+  }
+
+  void GetGraphicsPipeline(MTL_GRAPHICS_PIPELINE_DESC *pDesc,
+                           MTLCompiledGraphicsPipeline **ppPipeline) override {
+    std::call_once(eager_once_, [this]() { StartEagerWarmUp(); });
+    if (GetGraphicsPipelineImpl(pDesc, ppPipeline, false) && archive_) {
+      PipelineRecord record;
+      if (PipelineRecord::FromGraphicsDesc(*pDesc, record))
+        archive_->Record(record);
+    }
+  }
+
+  // true if a new pipeline was created and queued
+  bool GetGraphicsPipelineImpl(MTL_GRAPHICS_PIPELINE_DESC *pDesc,
+                               MTLCompiledGraphicsPipeline **ppPipeline, bool WarmUp) {
+    std::lock_guard<mullion::mutex> lock(mutex_);
+    // SC6 fork: the pipeline under the sc6-optimizations.ini settings in force (d3d11_sc6_paths.hpp)
+    pDesc->SettingsKey = Sc6SettingsKey();
+
+    if (auto iter = pipelines_.find(*pDesc); iter != pipelines_.end()) {
+      *ppPipeline = iter->second.get();
+      // SC6 fork: the game needs a warm-up pipeline now; if it still waits in the low-priority queue, move it to the
+      // normal queue
+      if (!WarmUp && !warm_pending_.empty() && warm_pending_.erase(iter->second.get()) &&
+          !iter->second->GetIsDone())
+        scheduler_.promote(iter->second.get());
+      return false;
+    }
+    auto [iter, inserted] =
+        pipelines_.insert({*pDesc, CreateGraphicsPipeline(device, pDesc, archive_.get(), WarmUp)});
+    if (!inserted) {
+      D3D11_ASSERT(0 && "duplicated graphics pipeline");
+    } else {
+      iter->second->description = &iter->first;
+      if (WarmUp) {
+        warm_pending_.insert(iter->second.get());
+        scheduler_.submit_low(iter->second.get());
+      } else {
+        scheduler_.submit(iter->second.get());
+      }
+    }
+    *ppPipeline = iter->second.get();
+    return inserted;
+  }
+
+  void GetGeometryPipeline(
+      MTL_GRAPHICS_PIPELINE_DESC *pDesc,
+      MTLCompiledGeometryPipeline **ppPipeline) override {
+    // SC6 fork: geometry shader pipelines are recorded and warmed up like graphics pipelines
+    if (GetGeometryPipelineImpl(pDesc, ppPipeline, false) && archive_) {
+      PipelineRecord record;
+      if (PipelineRecord::FromGraphicsDesc(*pDesc, record)) {
+        record.kind = PipelineRecord::Geometry;
+        archive_->Record(record);
+      }
+    }
+  }
+
+  // true if a new pipeline was created and queued
+  bool GetGeometryPipelineImpl(MTL_GRAPHICS_PIPELINE_DESC *pDesc, MTLCompiledGeometryPipeline **ppPipeline,
+                               bool WarmUp) {
+    std::lock_guard<mullion::mutex> lock(mutex_gs_);
+    pDesc->SettingsKey = Sc6SettingsKey();
+
+    if (auto iter = pipelines_gs_.find(*pDesc); iter != pipelines_gs_.end()) {
+      *ppPipeline = iter->second.get();
+      if (!WarmUp && !warm_pending_gs_.empty() && warm_pending_gs_.erase(iter->second.get()) &&
+          !iter->second->GetIsDone())
+        scheduler_.promote(iter->second.get());
+      return false;
+    }
+    auto [iter, inserted] =
+        pipelines_gs_.insert({*pDesc, CreateGeometryPipeline(device, pDesc, archive_.get(), WarmUp)});
+    if (!inserted) {
+      D3D11_ASSERT(0 && "duplicated geometry pipeline");
+    } else {
+      iter->second->description = &iter->first;
+      if (WarmUp) {
+        warm_pending_gs_.insert(iter->second.get());
+        scheduler_.submit_low(iter->second.get());
+      } else {
+        scheduler_.submit(iter->second.get());
+      }
+    }
+    *ppPipeline = iter->second.get();
+    return inserted;
+  }
+
+  void GetTessellationPipeline(MTL_GRAPHICS_PIPELINE_DESC * pDesc,
+                                   MTLCompiledTessellationMeshPipeline *
+                                       *ppPipeline) override {
+    std::lock_guard<mullion::mutex> lock(mutex_ts_);
+    pDesc->SettingsKey = Sc6SettingsKey();
+
+    if (auto iter = pipelines_ts_.find(*pDesc); iter != pipelines_ts_.end()) {
+      *ppPipeline = iter->second.get();
+      return;
+    }
+    auto [iter, inserted] = pipelines_ts_.insert({*pDesc, CreateTessellationMeshPipeline(device, pDesc)});
+    if (!inserted) {
+      D3D11_ASSERT(0 && "duplicated tessellation pipeline");
+    } else {
+      iter->second->description = &iter->first;
+      scheduler_.submit(iter->second.get());
+    }
+    *ppPipeline = iter->second.get();
+  }
+
+  void GetComputePipeline(MTL_COMPUTE_PIPELINE_DESC *pDesc,
+                                  MTLCompiledComputePipeline **ppPipeline) override {
+    if (GetComputePipelineImpl(pDesc, ppPipeline, false) && archive_) {
+      PipelineRecord record;
+      record.kind = PipelineRecord::Compute;
+      record.shader_mask = 1 << PipelineRecord::SlotCompute;
+      record.shaders[PipelineRecord::SlotCompute] = pDesc->ComputeShader->sha1();
+      archive_->Record(record);
+    }
+  }
+
+  bool GetComputePipelineImpl(MTL_COMPUTE_PIPELINE_DESC *pDesc,
+                              MTLCompiledComputePipeline **ppPipeline, bool WarmUp) {
+    std::lock_guard<mullion::mutex> lock(mutex_cs_);
+
+    SettingsComputeShader key{Sc6SettingsKey(), pDesc->ComputeShader};
+    if (auto iter = pipelines_cs_.find(key); iter != pipelines_cs_.end()) {
+      *ppPipeline = iter->second.get();
+      if (!WarmUp && !warm_pending_cs_.empty() && warm_pending_cs_.erase(iter->second.get()) &&
+          !iter->second->GetIsDone())
+        scheduler_.promote(iter->second.get());
+      return false;
+    }
+    auto [iter, inserted] = pipelines_cs_.insert(
+        {key, CreateComputePipeline(device, pDesc->ComputeShader, archive_.get(), WarmUp)});
+    if (!inserted) {
+      D3D11_ASSERT(0 && "duplicated compute pipeline");
+    } else if (WarmUp) {
+      warm_pending_cs_.insert(iter->second.get());
+      scheduler_.submit_low(iter->second.get());
+    } else {
+      scheduler_.submit(iter->second.get());
+    }
+    *ppPipeline = iter->second.get();
+    return inserted;
+  }
+
+public:
+  PipelineCache(MTLD3D11Device *pDevice) :
+      scache_(ShaderCache::getInstance(pDevice->GetMullionDevice().metalVersion())),
+      device(pDevice),
+      archive_(PipelineArchive::Create(pDevice->GetMTLDevice(), pDevice->GetMullionDevice().metalVersion())),
+      blend_states(pDevice),
+      so_layouts(pDevice) {
+    // SC6 fork: warm-up compiles may use all but 2 cores (d3d11.pipelineWarmUpThreads; 0 = that default). They
+    // run only while no compile that the game waits for is queued.
+    // sc6-optimizations.ini's WideWarmUpThreads = false keeps the scheduler's own limit
+    {
+      std::lock_guard<std::mutex> lock(eager_mutex_);
+      ApplyWideWarmUp(true);
+    }
+    toggle_listener_ = Sc6AddToggleListener([this]() { OnTogglesChanged(); });
+    Sc6WatchLog(Sc6Toggle::PostProcessingOff, str::format(
+        "sc6-optimizations.ini says ", Sc6ToggleValue(Sc6Toggle::PostProcessingOff).value_or(true) ? "on" : "off",
+        "; the SC6-VRR scripts apply it to Engine.ini while the game is closed"));
+  }
+
+  ~PipelineCache() {
+    // waits for a reload that runs OnTogglesChanged, so none starts the warm-up thread after this
+    Sc6RemoveToggleListener(toggle_listener_);
+    std::lock_guard<std::mutex> lock(eager_mutex_);
+    eager_stop_.store(true);
+    if (eager_.joinable())
+      eager_.join();
+  }
+};
+
+std::unique_ptr<MTLD3D11PipelineCacheBase>
+InitializePipelineCache(MTLD3D11Device *device) {
+  return std::make_unique<PipelineCache>(device);
+}
+
+}; // namespace mullion

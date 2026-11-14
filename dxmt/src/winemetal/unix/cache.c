@@ -1,0 +1,331 @@
+#import <Foundation/Foundation.h>
+#include "sqlite3.h"
+#define WINEMETAL_API
+#include "../winemetal_thunks.h"
+
+@interface CacheReader : NSObject
+- (instancetype)initWithPath:(NSString *)path version:(uint64_t)version;
+- (dispatch_data_t)get:(NSData *)key;
+@end
+
+@interface CacheWriter : NSObject
+- (instancetype)initWithPath:(NSString *)path version:(uint64_t)version;
+- (void)set:(NSData *)key value:(dispatch_data_t)value;
+@end
+
+@interface CacheReader () {
+  sqlite3 *_db;
+  sqlite3_stmt *_stmt;
+}
+@end
+
+NSString *
+resolve_cache_dir(NSString *path, bool path_is_file) {
+  if (![path hasPrefix:@"/"]) {
+    char buf[PATH_MAX];
+    size_t len = confstr(_CS_DARWIN_USER_CACHE_DIR, buf, sizeof(buf));
+
+    if (!len) {
+      return nil;
+    }
+
+    NSString *base = [NSString stringWithUTF8String:buf];
+    path = [base stringByAppendingPathComponent:path];
+  }
+  [[NSFileManager defaultManager] createDirectoryAtPath:path_is_file ? [path stringByDeletingLastPathComponent] : path
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:nil];
+  return path;
+}
+
+@implementation CacheReader
+
+- (instancetype)initWithPath:(NSString *)path version:(uint64_t)version {
+  if ((self = [super init])) {
+    NSString *dbPath = resolve_cache_dir(path, true);
+    if (!dbPath) {
+      NSLog(@"[CacheReader] Failed to resolve cache path");
+      return nil;
+    }
+    NSString *tableName = [NSString stringWithFormat:@"cache_%llu", version];
+    if (sqlite3_open_v2([dbPath fileSystemRepresentation], &_db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL) !=
+        SQLITE_OK) {
+      NSLog(@"[CacheReader] Failed to open DB: %s", sqlite3_errmsg(_db));
+      sqlite3_close(_db);
+      return nil;
+    }
+
+    NSString *sqlGet = [NSString stringWithFormat:@"SELECT value FROM %@ WHERE key = ?;", tableName];
+    if (sqlite3_prepare_v2(_db, sqlGet.UTF8String, -1, &_stmt, NULL) != SQLITE_OK) {
+      NSLog(@"[CacheReader] Failed to prepare SELECT: %s", sqlite3_errmsg(_db));
+      sqlite3_close(_db);
+      return nil;
+    }
+  }
+  return self;
+}
+
+- (dispatch_data_t)get:(NSData *)key {
+  sqlite3_reset(_stmt);
+  sqlite3_clear_bindings(_stmt);
+  sqlite3_bind_blob64(_stmt, 1, key.bytes, key.length, SQLITE_STATIC);
+
+  dispatch_data_t result = nil;
+  if (sqlite3_step(_stmt) == SQLITE_ROW) {
+    const void *bytes = sqlite3_column_blob(_stmt, 0);
+    int len = sqlite3_column_bytes(_stmt, 0);
+    result = dispatch_data_create(bytes, len, nil, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+  }
+  sqlite3_reset(_stmt);
+  return result;
+}
+
+- (void)dealloc {
+  if (_stmt)
+    sqlite3_finalize(_stmt);
+  if (_db)
+    sqlite3_close(_db);
+  [super dealloc];
+}
+
+@end
+
+@interface CacheWriter () {
+  sqlite3 *_db;
+  sqlite3_stmt *_stmt, *_delete_stmt;
+  int _lock_fd;
+}
+@end
+
+@implementation CacheWriter
+
+- (instancetype)initWithPath:(NSString *)path version:(uint64_t)version {
+  if ((self = [super init])) {
+    _lock_fd = -1;
+    NSString *dbPath = resolve_cache_dir(path, true);
+    if (!dbPath) {
+      NSLog(@"[CacheReader] Failed to resolve cache path");
+      [self release];
+      return nil;
+    }
+
+    NSString *lockPath = [dbPath stringByAppendingString:@"-lock"];
+    _lock_fd = open([lockPath fileSystemRepresentation], O_RDWR | O_CREAT, 0666);
+    if (_lock_fd < 0) {
+      NSLog(@"[CacheWriter] Failed to open file for locking %@", lockPath);
+      [self release];
+      return nil;
+    }
+    while (flock(_lock_fd, LOCK_EX)) {
+      if (errno == EINTR)
+        continue;
+      NSLog(@"[CacheWriter] Failed to lock DB: %s", strerror(errno));
+      [self release];
+      return nil;
+    }
+
+    if (sqlite3_open_v2(
+            [dbPath fileSystemRepresentation], &_db, //
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX, NULL
+        ) != SQLITE_OK) {
+      NSLog(@"[CacheWriter] Failed to open DB: %s", sqlite3_errmsg(_db));
+      [self release];
+      return nil;
+    }
+
+    sqlite3_exec(_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    sqlite3_exec(_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
+
+    NSString *tableName = [NSString stringWithFormat:@"cache_%llu", version];
+    NSString *sqlCreate = [NSString stringWithFormat:@"CREATE TABLE IF NOT EXISTS %@ ("
+                                                      "key BLOB PRIMARY KEY, "
+                                                      "value BLOB NOT NULL);",
+                                                     tableName];
+
+    char *errMsg = NULL;
+    if (sqlite3_exec(_db, sqlCreate.UTF8String, NULL, NULL, &errMsg) != SQLITE_OK) {
+      NSLog(@"[CacheWriter] Failed to create table: %s", errMsg);
+      sqlite3_free(errMsg);
+    }
+
+    flock(_lock_fd, LOCK_UN);
+
+    NSString *sqlSet = [NSString stringWithFormat:@"INSERT OR REPLACE INTO %@ (key, value) VALUES (?, ?);", tableName];
+    NSString *sqlDelete = [NSString stringWithFormat:@"DELETE FROM %@ WHERE key = ?;", tableName];
+    if (sqlite3_prepare_v2(_db, sqlSet.UTF8String, -1, &_stmt, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(_db, sqlDelete.UTF8String, -1, &_delete_stmt, NULL) != SQLITE_OK) {
+      NSLog(@"[CacheWriter] Failed to prepare write: %s", sqlite3_errmsg(_db));
+      [self release];
+      return nil;
+    }
+  }
+  return self;
+}
+
+- (void)set:(NSData *)key value:(dispatch_data_t)value {
+  while (flock(_lock_fd, LOCK_EX)) {
+    if (errno == EINTR)
+      continue;
+    NSLog(@"[CacheWriter] Failed to lock DB: %s", strerror(errno));
+    return;
+  }
+  sqlite3_stmt *stmt = value ? _stmt : _delete_stmt;
+  sqlite3_reset(stmt);
+  sqlite3_clear_bindings(stmt);
+  sqlite3_bind_blob64(stmt, 1, key.bytes, key.length, SQLITE_STATIC);
+
+  const void *bytes = NULL;
+  size_t length = 0;
+  dispatch_data_t flat = value ? dispatch_data_create_map(value, &bytes, &length) : NULL;
+  if (value)
+    sqlite3_bind_blob64(stmt, 2, bytes, length, SQLITE_STATIC);
+
+  if (sqlite3_step(stmt) != SQLITE_DONE)
+    NSLog(@"[CacheWriter] Failed to write: %s", sqlite3_errmsg(_db));
+
+  if (flat)
+    dispatch_release(flat);
+  sqlite3_reset(stmt);
+  flock(_lock_fd, LOCK_UN);
+}
+
+- (void)dealloc {
+  if (_stmt)
+    sqlite3_finalize(_stmt);
+  if (_delete_stmt)
+    sqlite3_finalize(_delete_stmt);
+  if (_db)
+    sqlite3_close(_db);
+  if (_lock_fd >= 0)
+    close(_lock_fd);
+  [super dealloc];
+}
+
+@end
+
+int
+_CacheReader_alloc_init(void *obj) {
+  struct unixcall_cache_alloc_init *params = obj;
+  NSString *path = [[NSString alloc] initWithCString:params->path.ptr encoding:NSUTF8StringEncoding];
+  params->ret_cache = (obj_handle_t)[[CacheReader alloc] initWithPath:path version:params->version];
+  [path release];
+  return 0;
+}
+
+int
+_CacheReader_get(void *obj) {
+  struct unixcall_cache_get *params = obj;
+  NSMutableData *key = [[NSMutableData alloc] initWithBytes:&params->key_length length:sizeof(params->key_length)];
+  [key appendBytes:params->key.ptr length:params->key_length];
+  const char *skip = (getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP"));
+  if (skip)
+    [key appendBytes:skip length:strlen(skip)];
+  const char *hoist = getenv("MULLION_AIRCONV_HOIST_LOADS");
+  if (hoist)
+    [key appendBytes:hoist length:strlen(hoist)];
+  CacheReader *reader = (CacheReader *)params->cache;
+  params->ret_data = (obj_handle_t)[reader get:key];
+  [key release];
+  return 0;
+}
+
+int
+_CacheWriter_alloc_init(void *obj) {
+  struct unixcall_cache_alloc_init *params = obj;
+  NSString *path = [[NSString alloc] initWithCString:params->path.ptr encoding:NSUTF8StringEncoding];
+  params->ret_cache = (obj_handle_t)[[CacheWriter alloc] initWithPath:path version:params->version];
+  [path release];
+  return 0;
+}
+
+int
+_CacheWriter_set(void *obj) {
+  struct unixcall_cache_set *params = obj;
+  // airconv reads the Unix environment, which Windows environment changes do not update
+  NSMutableData *key = [[NSMutableData alloc] initWithBytes:&params->key_length length:sizeof(params->key_length)];
+  [key appendBytes:params->key.ptr length:params->key_length];
+  const char *skip = (getenv("MULLION_AIRCONV_SKIP") ?: getenv("DXMT_AIRCONV_SKIP"));
+  if (skip)
+    [key appendBytes:skip length:strlen(skip)];
+  const char *hoist = getenv("MULLION_AIRCONV_HOIST_LOADS");
+  if (hoist)
+    [key appendBytes:hoist length:strlen(hoist)];
+  CacheWriter *writer = (CacheWriter *)params->cache;
+  [writer set:key value:(dispatch_data_t)params->value_data];
+  [key release];
+  return 0;
+}
+
+/* SC6 fork: small whole-file reads and writes in the cache directory, for the D3D11 pipeline archive */
+int
+_WMTReadCacheFile(void *obj) {
+  struct unixcall_read_cache_file *params = obj;
+  params->ret_size = 0;
+  params->ret_success = 0;
+  @autoreleasepool {
+    NSString *str = [NSString stringWithUTF8String:params->path.ptr];
+    NSString *path = str ? resolve_cache_dir(str, true) : nil;
+    if (!path)
+      return 0;
+    if (!params->buffer.ptr) {
+      /* size query: do not read a large file just to measure it */
+      NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+      if (!attributes)
+        return 0;
+      params->ret_size = [attributes fileSize];
+      params->ret_success = 1;
+      return 0;
+    }
+    NSData *data = [NSData dataWithContentsOfFile:path];
+    if (!data)
+      return 0;
+    params->ret_size = data.length;
+    if (params->capacity >= data.length)
+      memcpy(params->buffer.ptr, data.bytes, data.length);
+    params->ret_success = 1;
+  }
+  return 0;
+}
+
+int
+_WMTWriteCacheFile(void *obj) {
+  struct unixcall_write_cache_file *params = obj;
+  params->ret_success = 0;
+  @autoreleasepool {
+    NSString *str = [NSString stringWithUTF8String:params->path.ptr];
+    NSString *path = str ? resolve_cache_dir(str, true) : nil;
+    if (!path)
+      return 0;
+    NSData *data = [NSData dataWithBytesNoCopy:(void *)params->data.ptr length:params->size freeWhenDone:NO];
+    params->ret_success = [data writeToFile:path atomically:YES];
+  }
+  return 0;
+}
+
+#ifndef MULLION_NO_PRIVATE_API
+
+extern void MTLSetShaderCachePath(NSString* path);
+extern NSString* MTLGetShaderCachePath();
+
+int
+_WMTSetMetalShaderCachePath(void *obj) {
+  struct unixcall_setmetalcachepath *params = obj;
+  NSString *path = [[NSString alloc] initWithCString:params->path.ptr encoding:NSUTF8StringEncoding];
+  NSString *resolved_path = resolve_cache_dir(path, false);
+  MTLSetShaderCachePath(resolved_path);
+  params->ret_success = [MTLGetShaderCachePath() isEqualToString:resolved_path];
+  [path release];
+  return 0;
+};
+
+#else
+
+int
+_WMTSetMetalShaderCachePath(void *obj) {
+  struct unixcall_setmetalcachepath *params = obj;
+  params->ret_success = 0;
+  return 0;
+}
+
+#endif
