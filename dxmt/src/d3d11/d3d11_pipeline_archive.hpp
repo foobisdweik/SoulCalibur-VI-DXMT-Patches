@@ -190,6 +190,8 @@ private:
   /* Shared by pipeline compiles that read or add to the archive, exclusive
      while the archive is serialized. */
   void AddToArchive(WMT::Object pipeline);
+  // turns the archive off and sets its file aside after Metal refuses to write it
+  void DropAfterFailedWrite();
 
   std::shared_mutex archive_rw_;
   // one MTLBinaryArchive_add at a time (AddToArchive)

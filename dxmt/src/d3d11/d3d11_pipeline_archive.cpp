@@ -427,9 +427,26 @@ PipelineArchive::LoadList() {
     WARN("PipelineArchive: skipped ", skipped, " damaged or unsupported records in ", list_path_);
 }
 
+/* SC6 fork: every archived render pipeline needs a fragment function. On 2026-11-17 Metal refused to write the
+   archive again ("expecting 'fragment' stage in pipeline no. '1884'"), although no recorded pipeline turned
+   rasterization off. So the guard no longer trusts rasterization_enabled. */
 static bool
 Archivable(const WMTRenderPipelineInfo &info) {
-  return !info.rasterization_enabled || info.fragment_function != NULL_OBJECT_HANDLE;
+  return info.fragment_function != NULL_OBJECT_HANDLE;
+}
+
+/* the "name = ..." line of an MTLFunction's description, so a log line can name the shader */
+static std::string
+FunctionName(obj_handle_t function) {
+  if (function == NULL_OBJECT_HANDLE)
+    return "none";
+  std::string text = WMT::Object{function}.description().getUTF8String();
+  auto start = text.find("name = ");
+  if (start == std::string::npos)
+    return "unknown";
+  start += 7;
+  auto end = text.find_first_of(" \n", start);
+  return text.substr(start, end == std::string::npos ? std::string::npos : end - start);
 }
 
 WMT::Reference<WMT::RenderPipelineState>
@@ -498,6 +515,13 @@ PipelineArchive::AddRenderPipeline(WMTRenderPipelineInfo &info) {
     auto pso = device_.newRenderPipelineState(info, err);
     if (!pso)
       return;
+    /* Metal names a pipeline it cannot write by its place in the archive. Loaded pipelines come first, so with an
+       empty archive the add number here is close to that place (inferred). */
+    WARN(
+        "PipelineArchive: add ", added_.load(std::memory_order_relaxed) + 1, " (archive was ",
+        archive_loaded_ ? "loaded" : "empty", "): raster=", info.rasterization_enabled ? 1 : 0,
+        " vertex=", FunctionName(info.vertex_function), " fragment=", FunctionName(info.fragment_function)
+    );
     AddToArchive(pso);
   }
   added_.fetch_add(1, std::memory_order_relaxed);
@@ -715,6 +739,31 @@ PipelineArchive::MarkChanged() {
   last_change_.store(clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 }
 
+/* SC6 fork: after Metal refuses to write the archive without a fault, the archive in memory is not safe to write
+   again. On 2026-11-17 a later save in the same run wrote only the pipelines added in that run, and so replaced a
+   5 MB archive with a 78 KB one (inferred from the file contents). So the archive is off for the rest of the run.
+   The refused file moves to <archive>.failed, and an empty file takes its place, so the next run rebuilds the
+   archive from the recorded pipelines (warm-up) without the entry that Metal refused. */
+void
+PipelineArchive::DropAfterFailedWrite() {
+  {
+    std::unique_lock<std::shared_mutex> lock(archive_rw_);
+    archive_handle_ = NULL_OBJECT_HANDLE;
+  }
+  uint64_t size = 0;
+  std::vector<uint8_t> data;
+  if (WMTReadCacheFile(archive_path_.c_str(), nullptr, 0, &size) && size) {
+    data.resize(size);
+    if (WMTReadCacheFile(archive_path_.c_str(), data.data(), size, &size))
+      WMTWriteCacheFile((archive_path_ + ".failed").c_str(), data.data(), size);
+  }
+  WMTWriteCacheFile(archive_path_.c_str(), nullptr, 0);
+  WARN(
+      "PipelineArchive: the archive is off for this run; the next run rebuilds it, and the old file is ",
+      archive_path_, ".failed"
+  );
+}
+
 void
 PipelineArchive::SaveIfDirty() {
   std::lock_guard<mullion::mutex> save_lock(save_mutex_);
@@ -734,6 +783,7 @@ PipelineArchive::SaveIfDirty() {
     }
     if (err) {
       WARN("PipelineArchive: cannot write ", archive_path_, ": ", err.description().getUTF8String());
+      DropAfterFailedWrite();
     }
   }
   if (list_dirty_.exchange(false)) {
