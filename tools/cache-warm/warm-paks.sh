@@ -61,8 +61,14 @@ files=(
   "$dxmt_cache"/**/*(N.)
 )
 start=$EPOCHREALTIME
-# One process reads every file in order; a normal read goes through the file cache.
-cat -- $files > /dev/null 2>&1 || true
-bytes=$(stat -f %z -- $files | awk '{s+=$1} END{print s}')
+# cat reads the files in order; a normal read goes through the file cache.
+# The list goes through xargs, which runs cat in batches: the Mullion cache alone
+# has over 11,000 files, and their paths are more than macOS allows as the
+# arguments of one process (kern.argmax, 1 MB). cat's errors go to the log.
+if ! print -rN -- $files | xargs -0 cat > /dev/null; then
+  stamp "warning: some files could not be read"
+fi
+# A cache file can disappear between the glob and stat, so a stat error is not fatal.
+bytes=$(print -rN -- $files | xargs -0 stat -f %z 2>/dev/null | awk '{s+=$1} END{print s+0}') || true
 resident=$(python3 -I "$here/resident.py" $paks | tail -1 | awk '{print $1}')
 stamp "warmed ${#files} files, $(( bytes / 1000000 )) MB in $(printf %.1f $(( EPOCHREALTIME - start ))) s; paks in RAM: $resident"
