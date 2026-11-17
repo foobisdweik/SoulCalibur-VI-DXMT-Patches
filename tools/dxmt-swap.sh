@@ -31,7 +31,7 @@ typeset -A alias=(
 )
 
 version() {  # the build's version string, such as v0.80-1316-g41fe9c0b
-  local v; v=$(strings "$1/aarch64-windows/d3d11.dll" 2>/dev/null | grep -E '^v[0-9]+\.[0-9]+-[0-9]+-g[0-9a-f]+' | head -1) || true
+  local v; v=$(strings "$1/aarch64-windows/d3d11.dll" 2>/dev/null | grep -E '^v[0-9][^ ]*-g[0-9a-f]+' | head -1) || true
   print -r -- "${v:-unknown}"
 }
 sum() { shasum "$1/aarch64-windows/d3d11.dll" 2>/dev/null | cut -c1-40; }
