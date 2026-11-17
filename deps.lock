@@ -1,0 +1,31 @@
+# External dependencies that are too large for git. tools/fetch-deps.sh reads this file.
+#
+# One dependency per line, with whitespace between the columns:
+#   name     the name to give tools/fetch-deps.sh
+#   group    build (the DXMT build needs it), x86 (the x86_64 build only), runtime (a Wine to test builds in)
+#            or reference (source code for reading)
+#   kind     tar (an archive that tar unpacks), zip (an archive that ditto unpacks, which keeps code signatures),
+#            git (a clone of one commit) or manual (no public download, so you place it yourself)
+#   version  the upstream release or tag
+#   pin      tar and zip: the archive's SHA-256 hash. git: the commit. "-": not pinned yet
+#   dest     the folder it goes in, relative to the repository root
+#   strip    tar only: how many leading path parts to remove when unpacking ("-" for the other kinds)
+#   url      the download or clone URL ("-" for manual)
+#
+# The build pins match dxmt/.github/workflows/ci.yml, so a local build uses the same inputs as upstream CI.
+# GitHub publishes the SHA-256 hash of each release file, so a new pin can be read without a download:
+#   gh api repos/<owner>/<repo>/releases/tags/<tag> -q '.assets[] | .name + " " + .digest'
+
+llvm-mingw       build     tar     20260908         d1dc5d1ecf3a3ced5ed5544c72f1acd0c8e84eb3024d520ecc6b143eec62a149  toolchains/llvm-mingw-20260908-ucrt-macos-universal  1  https://github.com/mstorsjo/llvm-mingw/releases/download/20260908/llvm-mingw-20260908-ucrt-macos-universal.tar.xz
+wine-arm64ec     build     tar     wine-11.2        834ec0d4f1dff94de187f29891dc9938306ea2602d0fff603b407225c916d881  toolchains/wine-arm64ec                               2  https://github.com/3Shain/wine/releases/download/wine-11.2/wine-11.2.tar.gz
+llvm-project     build     git     llvmorg-15.0.7   8dfdcc7b7bf66834a761bd8de445840ef68e4d1a                          toolchains/llvm-project                               -  https://github.com/llvm/llvm-project.git
+
+# GitHub has no hash for this older release file, so it stays unpinned until someone downloads and checks it.
+wine-x86_64      x86       tar     v8.16-3shain     -                                                                 toolchains/wine                                       0  https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz
+
+# The signed and notarized MetalSharp-Wine.app (1.4 GB). Its release notes say to use this file for arm64.
+metalsharp-wine  runtime   zip     v7.0             68f8acce238e09da334edb36301a954996bb1b9edbe2c1c6bc60fdf483df99a0  runtimes/metalsharp-wine-7.0                          -  https://github.com/metalsharp/MetalSharp-Wine/releases/download/v7.0/MetalSharp-Wine-7.0-arm64.zip
+
+# CodeWeavers publishes source archives only for stable CrossOver releases, not for Preview builds.
+# The local copy is CrossOver Preview 27.0.0.41303, whose wine/VERSION says "Wine version 11.21".
+crossover-sources reference manual 27.0.0.41303     -                                                                 reference/crossover-sources                           -  -

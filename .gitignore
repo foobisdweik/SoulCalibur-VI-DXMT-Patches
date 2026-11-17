@@ -32,6 +32,7 @@ tools/profile/bin/
 
 # Mega-repo: large or machine-local folders (README.md, Layout)
 /toolchains/
+/runtimes/
 /reference/
 /data/
 /.claude/
