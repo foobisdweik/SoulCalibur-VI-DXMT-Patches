@@ -13,5 +13,7 @@ sc6_env_list+=("CX_GAMEMODE_DRY_RUN=1" "DXMT_SHADER_CACHE=1" "MTL_HUD_ENABLED=0"
   "DXMT_CONFIG=dxgi.nativeFullscreen=False;d3d11.pipelineArchive=False;")
 sc6_encode_env "${sc6_env_list[@]}"
 "$cx_root/bin/wine" --bottle "${SC6_BOTTLE:-SC6-Rosetta}" --env "$sc6_env_arg" \
-  "$out/test-dxmt-patches.exe" > "$out/regression.log" 2>&1
+  "$out/test-dxmt-patches.exe" > "$out/regression.log" 2>&1 || sc6_status=$?
+# Print the log even when a check fails, because the log names the failing check.
 cat "$out/regression.log"
+exit ${sc6_status:-0}
