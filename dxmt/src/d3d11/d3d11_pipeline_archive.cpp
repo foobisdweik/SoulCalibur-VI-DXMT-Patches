@@ -445,9 +445,12 @@ PipelineArchive::NewRenderPipelineState(
     return device_.newRenderPipelineState(info, err);
 
   std::shared_lock<std::shared_mutex> lock(archive_rw_);
+  // a faulted write may have turned the archive off since the check above (SaveIfDirty)
+  if (!archive_handle_)
+    return device_.newRenderPipelineState(info, err);
   info.binary_archives_for_lookup.set(&archive_handle_);
   info.num_binary_archives_for_lookup = 1;
-  info.binary_archive_for_serialization = NULL_OBJECT_HANDLE;
+  info.keep_for_binary_archive = false;
   if (archive_loaded_) {
     /* Fail instead of compiling on a miss. Metal does not report whether a
        lookup hit, so this is how hits are counted. */
@@ -466,23 +469,36 @@ PipelineArchive::NewRenderPipelineState(
   return pso;
 }
 
+/* Mullion: two adds to one archive at the same time leave an entry that Metal
+   faults on, then or when it writes the archive (MTLBinaryArchive_add). So the
+   adds take turns. The caller holds archive_rw_ shared, so no add runs while
+   the archive is serialized. */
+void
+PipelineArchive::AddToArchive(WMT::Object pipeline) {
+  std::lock_guard<mullion::mutex> lock(add_mutex_);
+  archive_.add(pipeline);
+}
+
 void
 PipelineArchive::AddRenderPipeline(WMTRenderPipelineInfo &info) {
   if (!archive_handle_ || !Archivable(info))
     return;
   {
     std::shared_lock<std::shared_mutex> lock(archive_rw_);
+    if (!archive_handle_)
+      return;
     info.binary_archives_for_lookup.set(&archive_handle_);
     info.num_binary_archives_for_lookup = 1;
-    info.binary_archive_for_serialization = archive_handle_;
+    /* winemetal keeps the descriptor with this second pipeline object, and the
+       add below hands it to the archive. Metal's own cache makes creating the
+       pipeline again cheap. */
+    info.keep_for_binary_archive = true;
     info.fail_on_binary_archive_miss = false;
-    /* winemetal adds the descriptor to the archive after it creates the
-       pipeline. The second pipeline object is not needed; Metal's own cache
-       makes creating it again cheap. */
     WMT::Reference<WMT::Error> err;
     auto pso = device_.newRenderPipelineState(info, err);
     if (!pso)
       return;
+    AddToArchive(pso);
   }
   added_.fetch_add(1, std::memory_order_relaxed);
   archive_dirty_.store(true);
@@ -498,9 +514,12 @@ PipelineArchive::NewComputePipelineState(
     return device_.newComputePipelineState(info, err);
 
   std::shared_lock<std::shared_mutex> lock(archive_rw_);
+  // a faulted write may have turned the archive off since the check above (SaveIfDirty)
+  if (!archive_handle_)
+    return device_.newComputePipelineState(info, err);
   info.binary_archives_for_lookup.set(&archive_handle_);
   info.num_binary_archives_for_lookup = 1;
-  info.binary_archive_for_serialization = NULL_OBJECT_HANDLE;
+  info.keep_for_binary_archive = false;
   if (archive_loaded_) {
     info.fail_on_binary_archive_miss = true;
     auto pso = device_.newComputePipelineState(info, err);
@@ -523,14 +542,17 @@ PipelineArchive::AddComputePipeline(WMTComputePipelineInfo &info) {
     return;
   {
     std::shared_lock<std::shared_mutex> lock(archive_rw_);
+    if (!archive_handle_)
+      return;
     info.binary_archives_for_lookup.set(&archive_handle_);
     info.num_binary_archives_for_lookup = 1;
-    info.binary_archive_for_serialization = archive_handle_;
+    info.keep_for_binary_archive = true;
     info.fail_on_binary_archive_miss = false;
     WMT::Reference<WMT::Error> err;
     auto pso = device_.newComputePipelineState(info, err);
     if (!pso)
       return;
+    AddToArchive(pso);
   }
   added_.fetch_add(1, std::memory_order_relaxed);
   archive_dirty_.store(true);
@@ -701,7 +723,14 @@ PipelineArchive::SaveIfDirty() {
     {
       /* exclusive: no pipeline may be added while Metal writes the archive */
       std::unique_lock<std::shared_mutex> lock(archive_rw_);
-      archive_.serialize(archive_path_.c_str(), err);
+      if (!archive_.serialize(archive_path_.c_str(), err)) {
+        /* Mullion: Metal faulted while it wrote the archive, so every later call on it would hang. Stop using it,
+           and drop the handle without a release, which is a call on it too. */
+        archive_.handle = NULL_OBJECT_HANDLE;
+        archive_handle_ = NULL_OBJECT_HANDLE;
+        WARN("PipelineArchive: Metal faulted writing ", archive_path_, "; the archive is off for this run");
+        return;
+      }
     }
     if (err) {
       WARN("PipelineArchive: cannot write ", archive_path_, ": ", err.description().getUTF8String());

@@ -189,7 +189,11 @@ private:
 
   /* Shared by pipeline compiles that read or add to the archive, exclusive
      while the archive is serialized. */
+  void AddToArchive(WMT::Object pipeline);
+
   std::shared_mutex archive_rw_;
+  // one MTLBinaryArchive_add at a time (AddToArchive)
+  mullion::mutex add_mutex_;
   WMT::Reference<WMT::BinaryArchive> archive_;
   obj_handle_t archive_handle_ = NULL_OBJECT_HANDLE;
   /* false when the archive started empty: then every lookup would miss, so
