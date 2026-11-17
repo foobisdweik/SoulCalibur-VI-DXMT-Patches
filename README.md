@@ -81,6 +81,4 @@ git merge -X subtree=dxmt mullion/main
 
 Upstream DXMT's `AGENTS.md` does not accept AI-generated contributions, so changes from this repository do not go upstream.
 
-## Old paths
-
-`~/Developer/SC6-VRR`, `~/Developer/dxmt-SC6` and `~/Developer/crossover-sources` are links to the new places, so old notes and commands still work. Mirror backups of the old repositories from before the move are in `data/app-support/backups/git-20261114/`.
+Mirror backups of the old repositories from before the merge are in `data/app-support/backups/git-20261114/`.
