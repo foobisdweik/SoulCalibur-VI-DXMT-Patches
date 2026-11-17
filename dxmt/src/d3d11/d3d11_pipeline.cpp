@@ -46,7 +46,7 @@ public:
     // shader writes them on its own (no geometry shader of any kind) and the pixel shader takes every input as a plain
     // one: it pulls none (FineShading also covers EvaluateAttribute*; a partial sample mask pulls centroids) and reads
     // none at a vertex (mullion.splitVaryings, d3d11_sc6_paths.hpp). The pipeline's settings key says it, so that a
-    // reload of sc6-optimizations.ini after the lookup cannot store a pipeline under the other setting.
+    // reload of sc6vrr.ini [optimizations] after the lookup cannot store a pipeline under the other setting.
     bool packed_varyings = false;
     const char *split_reason = "mullion.splitVaryings is on";
     if (Sc6SettingsKeyPacksVaryings(pDesc->SettingsKey)) {

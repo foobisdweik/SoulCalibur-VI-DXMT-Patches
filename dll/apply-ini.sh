@@ -70,7 +70,7 @@ print -rl -- "  "${^sc6_launch_env}
 [[ $(stat -f %m:%z "$sc6_ini") == $stamp ]] && break
 sleep 1
 done
-# sc6-optimizations.ini next to the game: the toggles d3d11.dll cannot apply
-# itself (PostProcessingOff, in Engine.ini)
+# The [optimizations] toggles that d3d11.dll cannot apply itself
+# (PostProcessingOff, in Engine.ini)
 "$repo/config/apply-optimizations.sh" || print -u2 "config/apply-optimizations.sh failed"
 

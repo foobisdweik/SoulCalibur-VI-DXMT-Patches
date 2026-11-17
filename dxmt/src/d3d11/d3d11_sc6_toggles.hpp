@@ -5,7 +5,7 @@
 
 namespace mullion {
 
-/* SC6 fork: the optimizations of the SC6 build, which sc6-optimizations.ini next to the game's executable turns on or
+/* SC6 fork: the optimizations of the SC6 build, which sc6vrr.ini [optimizations] next to the game's executable turns on or
  * off. The file holds only booleans, one `Name = true` or `Name = false` a line, and each optimization `X` has a
  * `WatchX` under it, which logs what that optimization does (WARN lines that start with "[watch] X"). A name the file
  * leaves out keeps its default: the config option or the SoulcaliburVI.exe profile.
@@ -41,10 +41,10 @@ enum class Sc6Toggle : unsigned {
 
 const char *Sc6ToggleName(Sc6Toggle toggle);
 
-/* what sc6-optimizations.ini sets the toggle to, or nothing when it leaves it out */
+/* what sc6vrr.ini [optimizations] sets the toggle to, or nothing when it leaves it out */
 std::optional<bool> Sc6ToggleValue(Sc6Toggle toggle);
 
-/* whether sc6-optimizations.ini has WatchX = true for the toggle */
+/* whether sc6vrr.ini [optimizations] has WatchX = true for the toggle */
 bool Sc6Watch(Sc6Toggle toggle);
 
 /* `listener` runs on the watcher thread after each reload, once the paths follow the new values; the id removes it.

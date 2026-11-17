@@ -56,7 +56,8 @@ Trim(const std::string &s) {
   return s.substr(begin, end - begin + 1);
 }
 
-// false when the file does not exist
+// false when the file does not exist. Only the [optimizations] section of sc6vrr.ini counts: the file's other
+// sections belong to the sc6vrr DLL and the launch scripts.
 static bool
 Parse(ToggleFile &file) {
   std::ifstream stream(str::topath(g_path.c_str()).c_str());
@@ -64,10 +65,18 @@ Parse(ToggleFile &file) {
     return false;
   std::string line;
   unsigned number = 0;
+  bool in_section = false;
   while (std::getline(stream, line)) {
     number++;
-    line = Trim(line);
+    // text after ";" is a comment, as in the rest of sc6vrr.ini
+    line = Trim(line.substr(0, line.find(';')));
     if (line.empty())
+      continue;
+    if (line.front() == '[') {
+      in_section = Lower(line) == "[optimizations]";
+      continue;
+    }
+    if (!in_section)
       continue;
     auto eq = line.find('=');
     std::string key = eq == std::string::npos ? "" : Lower(Trim(line.substr(0, eq)));
@@ -136,6 +145,13 @@ Reload() {
     old_values[i] = g_values[i].load();
     old_watch[i] = g_watch[i].load();
   }
+  /* Saves of sc6vrr.ini that change only the DLL's or the launch scripts' sections leave the toggles as they were.
+     Skip those, because the listeners below restart the pipeline warm-up. */
+  bool changed = false;
+  for (size_t i = 0; i < kCount; i++)
+    changed |= Encode(file.values[i]) != old_values[i] || file.watch[i] != old_watch[i];
+  if (!changed)
+    return;
   Store(file);
   WARN("SC6 toggles reloaded from ", g_path, ": ",
        !exists ? std::string("no file, so every optimization keeps its default")
@@ -185,7 +201,7 @@ Init() {
   std::call_once(g_once, [] {
     auto exe = env::getExePath();
     auto slash = exe.find_last_of(env::PlatformDirSlash);
-    g_path = (slash == std::string::npos ? std::string() : exe.substr(0, slash + 1)) + "sc6-optimizations.ini";
+    g_path = (slash == std::string::npos ? std::string() : exe.substr(0, slash + 1)) + "sc6vrr.ini";
     ToggleFile file;
     if (!Parse(file))
       Logger::info(str::format("SC6 toggles: no ", g_path, ", so every optimization keeps its default"));

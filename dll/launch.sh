@@ -26,9 +26,6 @@ SC6_BOTTLE=$bottle SC6_WIN64=$win64 "$here/install.sh"
 # Keep CrossOver GUI launches in step with this launcher.
 SC6_BOTTLE=$bottle SC6_WIN64=$win64 "$here/apply-ini.sh" >/dev/null
 sc6_encode_env "${sc6_env_list[@]}"
-# A record of this launch's process environment. The DLL's own settings are in
-# sc6vrr.ini, and the DLL logs the values it used to sc6vrr.log.
-print -rl -- "${sc6_env_list[@]}" > "$win64/unlocked-environment.txt"
 "$wine" --bottle "$bottle" --env "$sc6_env_arg" --workdir "$win64" --start "$win64/SoulcaliburVI.exe" \
   > "$win64/wine-unlocked.log" 2>&1 &
 print "Launched in $bottle with the settings in $win64/sc6vrr.ini."

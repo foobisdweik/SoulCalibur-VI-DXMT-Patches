@@ -81,7 +81,7 @@ Base() {
   return base;
 }
 
-// sc6-optimizations.ini's toggle for the path, which decides in place of the config option; the lists still turn a
+// sc6vrr.ini [optimizations]'s toggle for the path, which decides in place of the config option; the lists still turn a
 // path off
 static std::optional<bool>
 Optimization(Sc6Path path) {

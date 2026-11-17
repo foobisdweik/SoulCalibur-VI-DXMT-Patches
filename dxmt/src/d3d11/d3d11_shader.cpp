@@ -25,7 +25,7 @@ getGlobalShaderFlag(MTLD3D11Device *pDevice) {
       shader_flag = SM50_SHADER_FLAG(shader_flag & ~SM50_SHADER_FLAG_COHERENT_GROUP_SYNC);
   });
   // SC6 fork: read on every call, because the filter emulation turns on when a sampler first needs it, and the
-  // converter paths turned off (d3d11_sc6_paths.hpp) follow sc6-optimizations.ini; every variant hashes these flags
+  // converter paths turned off (d3d11_sc6_paths.hpp) follow sc6vrr.ini [optimizations]; every variant hashes these flags
   return SM50_SHADER_FLAG(shader_flag | Sc6SkipShaderFlags() | SamplerEmulationsLeftOut());
 };
 
@@ -105,7 +105,7 @@ public:
         shader_->dump();
       }
     }
-    // SC6 fork: sc6-optimizations.ini's Watch* lines for the converter toggles
+    // SC6 fork: sc6vrr.ini [optimizations]'s Watch* lines for the converter toggles
     Sc6WatchConvertedShader(sm50_common.flags, func_name);
 
     return this;
