@@ -1705,25 +1705,70 @@ llvm::Error convertDXBC(
 };
 } // namespace mullion::dxbc
 
-bool CheckGSBBIsPassThrough(mullion::dxbc::BasicBlock *bb) {
+// A pass-through geometry shader copies its input primitive unchanged: before emit k, each instruction is a mov
+// from input vertex k's register r to output register r (the same components, with no modifier), and it emits
+// `vertices` vertices on stream 0, optionally followed by a cut. The vertex function can then make the copy itself
+// (MTL_GEOMETRY_SHADER_PASS_THROUGH), with no mesh stage.
+// The lambdas take const references because PackedVariantList::any passes const ones. With the earlier non-const
+// parameters no lambda but the generic one matched, so every shader failed the test and took the mesh path.
+static bool
+CheckGSBBIsPassThrough(mullion::dxbc::BasicBlock *bb, uint32_t vertices, uint32_t &emits) {
   using namespace mullion::dxbc;
+  bool cut = false;
   if (bb->instructions.any(patterns{
-        [](InstNop &) { return false; }, [](InstMov &mov) { return false; },
-        [](InstEmit &) { return false; }, [](InstCut &) { return false; },
-        [](auto &) { return true; }
+        [](const InstNop &) { return false; },
+        [&](const InstMov &mov) {
+          auto dst = std::get_if<DstOperandOutput>(&mov.dst);
+          auto src = std::get_if<SrcOperandInputICP>(&mov.src);
+          if (cut || mov._.saturate || !dst || !src || src->_.abs || src->_.neg)
+            return true;
+          auto vertex = std::get_if<uint32_t>(&src->cpid);
+          auto reg = std::get_if<uint32_t>(&src->regid);
+          if (!vertex || !reg || *vertex != emits || *reg != dst->regid)
+            return true;
+          std::array<int, 4> lanes = src->_.swizzle;
+          for (int c = 0; c < 4; c++)
+            if ((dst->_.mask >> c & 1) && lanes[c] != c)
+              return true;
+          return false;
+        },
+        [&](const InstEmit &emit) { return cut || emit.stream != 0 || ++emits > vertices; },
+        [&](const InstCut &stop) { return cut || stop.stream != 0 || emits != vertices || !(cut = true); },
+        [](const auto &) { return true; }
       }))
     return false;
 
   return std::visit(
     patterns{
-      [](mullion::dxbc::BasicBlockReturn) { return true; },
-      [](mullion::dxbc::BasicBlockUnconditionalBranch uncond) {
-        return CheckGSBBIsPassThrough(uncond.target);
+      [&](mullion::dxbc::BasicBlockReturn) { return emits == vertices; },
+      [&](mullion::dxbc::BasicBlockUnconditionalBranch uncond) {
+        return !cut && CheckGSBBIsPassThrough(uncond.target, vertices, emits);
       },
       [](auto) { return false; }
     },
     bb->target
   );
+}
+
+static bool
+CheckGSBBIsPassThrough(mullion::dxbc::SM50ShaderInternal *gs) {
+  using namespace microsoft;
+  // the vertex function draws the input primitive itself, so the output topology must be the same kind, and each
+  // input primitive must run the shader once
+  uint32_t vertices = 0;
+  if (gs->gs_input_primitive == D3D10_SB_PRIMITIVE_POINT &&
+      gs->gs_output_topology == D3D10_SB_PRIMITIVE_TOPOLOGY_POINTLIST)
+    vertices = 1;
+  else if (gs->gs_input_primitive == D3D10_SB_PRIMITIVE_LINE &&
+           gs->gs_output_topology == D3D10_SB_PRIMITIVE_TOPOLOGY_LINESTRIP)
+    vertices = 2;
+  else if (gs->gs_input_primitive == D3D10_SB_PRIMITIVE_TRIANGLE &&
+           gs->gs_output_topology == D3D10_SB_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
+    vertices = 3;
+  if (!vertices || gs->gs_instance_count > 1)
+    return false;
+  uint32_t emits = 0;
+  return CheckGSBBIsPassThrough(gs->entry(), vertices, emits);
 }
 
 bool CheckGSSignatureIsPassThrough(
@@ -2198,12 +2243,10 @@ static int SM50InitializeUncached(
     if (sm50_shader->shader_type == microsoft::D3D10_SB_GEOMETRY_SHADER) {
       if (binding_cbuffer_mask || binding_sampler_mask || binding_uav_mask ||
           binding_srv_hi_mask || binding_srv_lo_mask ||
-          !CheckGSBBIsPassThrough(sm50_shader->entry())) {
+          !CheckGSBBIsPassThrough(sm50_shader) ||
+          // the check fills Data while it reads, so a failure late in the signature leaves part of it set
+          !CheckGSSignatureIsPassThrough(inputParser, outputParser, pRefl->GeometryShader.Data)) {
         pRefl->GeometryShader.GSPassThrough = ~0u;
-      } else {
-        CheckGSSignatureIsPassThrough(
-          inputParser, outputParser, pRefl->GeometryShader.Data
-        );
       }
       pRefl->GeometryShader.Primitive = sm50_shader->gs_input_primitive;
       pRefl->GeometryShader.InstanceCount = sm50_shader->gs_instance_count;
