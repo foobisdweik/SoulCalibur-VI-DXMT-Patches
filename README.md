@@ -65,7 +65,10 @@ tools/dxmt-swap.sh <name>
 
 - `main` is the working branch. It was SC6-VRR's `native-metal-capture` branch.
 - `archive/vrr/*` and `archive/dxmt/*` keep the other branches of the two old repositories. `refs/archive/dxmt/stash` keeps the fork's old stash.
-- Remotes: `sc6vrr` (`foobisdweik/SC6-VRR`), `dxmt-sc6` (`foobisdweik/dxmt-SC6`) and `mullion` (`dttdrv/mullion`, the upstream project). Do not push this combined history to the old remotes without a decision first.
+- Remotes:
+  - `origin` (`foobisdweik/SoulCalibur-VI-DXMT-Patches`): this repository.
+  - `mullion` (`dttdrv/mullion`): the upstream project.
+  - `sc6vrr` (`foobisdweik/SC6-VRR`) and `dxmt-sc6` (`foobisdweik/dxmt-SC6`): the two old repositories. They are archived on GitHub, so they are read-only.
 - To merge upstream Mullion into `dxmt/`:
 
 ```bash
